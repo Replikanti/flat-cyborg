@@ -218,9 +218,40 @@ impl PtySession {
         }
     }
 
+    /// Returns a cloneable handle for writing input from another thread (e.g.
+    /// an interactive front-end forwarding the host's keystrokes), or `None`
+    /// if the session is already closing.
+    pub fn input_handle(&self) -> Option<InputHandle> {
+        self.input.as_ref().map(|tx| InputHandle(tx.clone()))
+    }
+
     /// The OS process id of the child.
     pub fn child_id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Waits up to `budget` for the child to exit and returns its status.
+    ///
+    /// On success the child has been reaped, so this marks the session
+    /// terminated — [`Drop`] will then skip signalling (the pid could be
+    /// recycled). Returns `None` if the child has not exited within `budget`.
+    pub fn wait_with_timeout(&mut self, budget: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.terminated = true;
+                    return Some(status);
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return None,
+            }
+        }
     }
 
     /// Mutable access to the child process handle (for signalling / waiting).
@@ -259,6 +290,27 @@ impl PtySession {
                 }
             }
         }
+    }
+}
+
+/// A cloneable, `Send` handle for writing input to a [`PtySession`]'s master
+/// from another thread. Writes are enqueued (non-blocking); the session's
+/// writer thread performs the actual write.
+#[derive(Clone)]
+pub struct InputHandle(Sender<Vec<u8>>);
+
+impl InputHandle {
+    /// Queues `bytes` to be written to the PTY master.
+    ///
+    /// # Errors
+    /// Returns an error if the session (and its writer thread) has shut down.
+    pub fn write(&self, bytes: &[u8]) -> Result<()> {
+        self.0.send(bytes.to_vec()).map_err(|_| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "pty writer thread terminated",
+            ))
+        })
     }
 }
 
