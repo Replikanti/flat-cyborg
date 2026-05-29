@@ -28,6 +28,40 @@ use flat_cyborg::{Outcome, PtySession, RawModeGuard, Wrapper, WrapperConfig};
 
 mod update;
 
+/// Built-in profiles for known LLM CLIs. A `--profile <name>` is a named bundle
+/// of settings for driving that tool; today it supplies the response marker its
+/// assistant reply lines begin with (verified by observation), and more per-CLI
+/// defaults can be added here over time. Override any of it with the explicit
+/// flags (e.g. `--response-marker`). The tool stays LLM-agnostic — this is just
+/// a name→settings map, one line per CLI.
+struct Profile {
+    name: &'static str,
+    response_marker: &'static str,
+}
+
+const PROFILES: &[Profile] = &[
+    Profile {
+        name: "claude",
+        response_marker: "●",
+    },
+    Profile {
+        name: "codex",
+        response_marker: "•",
+    },
+];
+
+fn find_profile(name: &str) -> Option<&'static Profile> {
+    PROFILES.iter().find(|p| p.name == name)
+}
+
+fn known_profiles() -> String {
+    PROFILES
+        .iter()
+        .map(|p| p.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 const HELP: &str = "\
 flat-cyborg — asynchronous PTY wrapper
 
@@ -45,6 +79,9 @@ OPTIONS:
     --prompt <TOKEN>    Trailing prompt token for IDLE detection (repeatable;
                         defaults to common shell prompts).
     --no-confirm        Do not auto-answer [y/n] confirmation prompts.
+    --profile <NAME>    Settings bundle for a known LLM CLI; currently sets
+                        --response-marker to that tool's reply glyph. Known:
+                        claude (●), codex (•). Explicit flags override it.
     --tui               Full-screen TUI mode: capture via a 2D screen grid and
                         treat a settled screen as idle (for apps using the
                         alternate screen / cursor addressing). Prints the final
@@ -113,6 +150,7 @@ fn parse_args() -> Result<Mode, String> {
     let mut config = WrapperConfig::default();
     let mut prompts: Vec<String> = Vec::new();
     let mut response_marker: Option<String> = None;
+    let mut profile: Option<String> = None;
 
     let mut i = 0;
     while i < opts.len() {
@@ -140,6 +178,7 @@ fn parse_args() -> Result<Mode, String> {
             }
             "--no-confirm" => config.auto_confirm = false,
             "--tui" => config.tui = true,
+            "--profile" => profile = Some(take_value("--profile")?),
             "--response-marker" => response_marker = Some(take_value("--response-marker")?),
             other => return Err(format!("unknown option: {other}")),
         }
@@ -148,6 +187,18 @@ fn parse_args() -> Result<Mode, String> {
 
     if !prompts.is_empty() {
         config.prompt_tokens = prompts;
+    }
+
+    // Apply a --profile's defaults, but never override a setting the user gave
+    // explicitly. An unknown profile name is an error (listing the known ones)
+    // so a typo fails loudly rather than silently doing nothing. The name is
+    // validated even when --response-marker already set it.
+    if let Some(name) = &profile {
+        let p = find_profile(name)
+            .ok_or_else(|| format!("unknown --profile: {name} (known: {})", known_profiles()))?;
+        if response_marker.is_none() {
+            response_marker = Some(p.response_marker.to_string());
+        }
     }
 
     Ok(Mode::Run(Args {
