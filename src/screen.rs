@@ -437,15 +437,19 @@ mod tests {
     }
 
     #[test]
-    fn pure_cursor_moves_do_not_mark_changed() {
-        // Settle detection must not be defeated by cursor-only churn.
+    fn content_diff_ignores_cursor_only_and_idempotent_repaints() {
         let mut s = Screen::new(5, 20);
-        assert!(s.feed(b"hello")); // content
+        assert!(s.feed(b"hello")); // content appeared
         assert!(!s.feed(b"\r")); // CR — cursor only
-        assert!(!s.feed(b"\x1b[3;3H")); // CUP — cursor only
         assert!(!s.feed(b"\x1b[2C")); // CUF — cursor only
         assert!(!s.feed(b"\x08")); // BS — cursor only
-        assert!(s.feed(b"\x1b[K")); // erase — content
+        // Repainting the exact same content is NOT a change (lets a
+        // timer-repaint TUI settle).
+        assert!(!s.feed(b"\x1b[1;1Hhello"));
+        // Erasing the line that holds content IS a change.
+        assert!(s.feed(b"\x1b[1;1H\x1b[2K"));
+        // Erasing an already-blank line is NOT a change.
+        assert!(!s.feed(b"\x1b[3;1H\x1b[2K"));
     }
 
     #[test]
