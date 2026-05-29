@@ -10,6 +10,19 @@
 //! movement, line/screen erasure, and the alternate-screen switch, so the
 //! visible screen can be rendered as clean text. It is driven by the same
 //! [`Parser`](crate::ansi) used elsewhere.
+//!
+//! # Scope and limitations
+//!
+//! This is intentionally a *partial* terminal emulator — enough to capture
+//! full-repaint and common cursor-addressed TUIs, not a complete VT
+//! implementation. It does **not** yet handle: scroll regions (DECSTBM),
+//! insert/delete line and character (IL/DL/ICH/DCH/ECH), repeat (REP), or
+//! autowrap mode (DECAWM). Wide / CJK / emoji characters are counted as a
+//! single cell, so absolute addressing can drift on screens that use them.
+//! Apps that fully repaint each frame (ratatui-style) render faithfully;
+//! incrementally-edited or scroll-region TUIs may show stale glyphs. These
+//! families can be added as needed; richer fidelity would warrant a
+//! purpose-built VT crate.
 
 use crate::ansi::{Parser, Perform};
 
@@ -21,6 +34,10 @@ struct Grid {
     cells: Vec<Vec<char>>,
     row: usize,
     col: usize,
+    /// Saved cursor for DECSC/DECRC (`ESC[s` / `ESC[u`), per buffer — kept
+    /// separate from the alternate-screen save so they cannot clobber each
+    /// other.
+    decsc: (usize, usize),
 }
 
 impl Grid {
@@ -31,6 +48,7 @@ impl Grid {
             cells: vec![vec![' '; cols]; rows],
             row: 0,
             col: 0,
+            decsc: (0, 0),
         }
     }
 
@@ -58,13 +76,17 @@ impl Grid {
         self.col += 1;
     }
 
-    fn line_feed(&mut self) {
+    /// Moves the cursor down one row, scrolling if at the bottom. Returns
+    /// `true` if a scroll occurred (a visible content change).
+    fn line_feed(&mut self) -> bool {
         if self.row + 1 >= self.rows {
             // Scroll up: drop the top line, append a blank bottom line.
             self.cells.remove(0);
             self.cells.push(vec![' '; self.cols]);
+            true
         } else {
             self.row += 1;
+            false
         }
     }
 
@@ -215,33 +237,47 @@ impl Perform for Screen {
     }
 
     fn execute(&mut self, byte: u8) {
+        // Only content-affecting operations mark the screen changed. Pure
+        // cursor moves (CR/BS/HT) do not, so settle detection is not defeated
+        // by cursor churn — mirroring the line Sanitizer's policy.
         match byte {
-            b'\n' => self.active().line_feed(),
+            b'\n' => {
+                if self.active().line_feed() {
+                    self.changed = true; // a scroll is a visible change
+                }
+            }
             b'\r' => self.active().carriage_return(),
             0x08 => self.active().backspace(),
             b'\t' => self.active().tab(),
-            _ => return,
+            _ => {}
         }
-        self.changed = true;
     }
 
     fn csi(&mut self, params: &[u16], private: Option<u8>, final_byte: u8) {
         // Alternate-screen switch: ESC[?1049h / ?47h / ?1047h (and the `l`
-        // variants to leave). Save/restore the cursor across the switch.
+        // variants to leave). Only ?1049 saves/restores the cursor; ?1049 and
+        // ?1047 clear the alternate buffer on entry; ?47 is a plain switch.
         if private == Some(b'?') {
             if let (Some(&p), true) = (params.first(), matches!(final_byte, b'h' | b'l')) {
                 if matches!(p, 1049 | 47 | 1047) {
                     let enter = final_byte == b'h';
                     if enter && !self.in_alternate {
-                        self.saved_cursor = (self.primary.row, self.primary.col);
-                        self.alternate.clear();
+                        if p == 1049 {
+                            self.saved_cursor = (self.primary.row, self.primary.col);
+                        }
+                        if p == 1049 || p == 1047 {
+                            self.alternate.clear();
+                        }
                         self.in_alternate = true;
+                        self.changed = true;
                     } else if !enter && self.in_alternate {
                         self.in_alternate = false;
-                        let (r, c) = self.saved_cursor;
-                        self.primary.move_to(r, c);
+                        if p == 1049 {
+                            let (r, c) = self.saved_cursor;
+                            self.primary.move_to(r, c);
+                        }
+                        self.changed = true;
                     }
-                    self.changed = true;
                 }
             }
             return; // other private modes (cursor visibility, etc.) are ignored
@@ -250,6 +286,7 @@ impl Perform for Screen {
         let p0 = params.first().copied().unwrap_or(0);
         let n = p0.max(1) as usize;
         match final_byte {
+            // Cursor moves — no content change.
             b'A' => {
                 let g = self.active();
                 g.row = g.row.saturating_sub(n);
@@ -283,17 +320,28 @@ impl Perform for Screen {
                 let col = params.get(1).copied().unwrap_or(1).max(1) as usize - 1;
                 self.active().move_to(row, col);
             }
-            b'J' => self.active().erase_display(p0),
-            b'K' => self.active().erase_line(p0),
-            b's' => self.saved_cursor = (self.active().row, self.active().col),
+            // DECSC/DECRC: per-buffer cursor save/restore (distinct from the
+            // alternate-screen save), no content change.
+            b's' => {
+                let g = self.active();
+                g.decsc = (g.row, g.col);
+            }
             b'u' => {
-                let (r, c) = self.saved_cursor;
+                let (r, c) = self.active().decsc;
                 self.active().move_to(r, c);
             }
+            // Erases — content change.
+            b'J' => {
+                self.active().erase_display(p0);
+                self.changed = true;
+            }
+            b'K' => {
+                self.active().erase_line(p0);
+                self.changed = true;
+            }
             // SGR and anything else affect rendering only.
-            _ => return,
+            _ => {}
         }
-        self.changed = true;
     }
 }
 
@@ -379,6 +427,36 @@ mod tests {
         let mut s = Screen::new(3, 10);
         assert!(s.feed(b"x"));
         assert!(!s.feed(b""));
+    }
+
+    #[test]
+    fn pure_cursor_moves_do_not_mark_changed() {
+        // Settle detection must not be defeated by cursor-only churn.
+        let mut s = Screen::new(5, 20);
+        assert!(s.feed(b"hello")); // content
+        assert!(!s.feed(b"\r")); // CR — cursor only
+        assert!(!s.feed(b"\x1b[3;3H")); // CUP — cursor only
+        assert!(!s.feed(b"\x1b[2C")); // CUF — cursor only
+        assert!(!s.feed(b"\x08")); // BS — cursor only
+        assert!(s.feed(b"\x1b[K")); // erase — content
+    }
+
+    #[test]
+    fn decsc_does_not_clobber_alternate_screen_save() {
+        let mut s = Screen::new(5, 20);
+        // Position the primary cursor and remember where the alt-screen save
+        // should restore it to.
+        s.feed(b"\x1b[3;7Hseed");
+        // Enter alt screen (saves primary cursor), then the alt TUI uses
+        // DECSC/DECRC for its own purposes.
+        s.feed(b"\x1b[?1049h\x1b[1;1H\x1b[s\x1b[5;5HX\x1b[u");
+        // Leaving alt screen must restore the *primary* cursor (after "seed",
+        // col 10), not the alt buffer's DECSC slot.
+        s.feed(b"\x1b[?1049lZ");
+        // Z lands where "seed" left the primary cursor: row 2 (0-based), col 10
+        // (directly after the 'd' at col 9).
+        let line = s.text().lines().nth(2).unwrap_or("").to_string();
+        assert_eq!(line, "      seedZ");
     }
 
     #[test]
