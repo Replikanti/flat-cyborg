@@ -44,6 +44,9 @@ const READ_CHUNK: usize = 8192;
 const READER_JOIN_BUDGET: Duration = Duration::from_secs(2);
 /// Upper bound on how long [`Drop`] waits for the writer thread.
 const WRITER_JOIN_BUDGET: Duration = Duration::from_secs(1);
+/// Upper bound on reaping the child after SIGKILL, so a wedged (D-state) child
+/// cannot hang teardown indefinitely.
+const TERMINATE_REAP_BUDGET: Duration = Duration::from_secs(2);
 
 /// The result of polling the PTY for output.
 #[derive(Debug)]
@@ -74,6 +77,9 @@ pub struct PtySession {
     /// Set once the output channel disconnects, so repeated polling after EOF
     /// honors the timeout instead of busy-spinning.
     eof: AtomicBool,
+    /// Guards against signalling the process group twice (the second time the
+    /// pid may have been recycled).
+    terminated: bool,
 }
 
 impl PtySession {
@@ -167,6 +173,7 @@ impl PtySession {
             reader: Some(reader),
             writer: Some(writer),
             eof: AtomicBool::new(false),
+            terminated: false,
         })
     }
 
@@ -220,6 +227,39 @@ impl PtySession {
     pub fn child(&mut self) -> &mut Child {
         &mut self.child
     }
+
+    /// SIGKILLs the child's entire process group and reaps the child.
+    ///
+    /// Used by the watchdog as the last-resort step after a graceful interrupt,
+    /// and by [`Drop`]. Idempotent: signalling happens at most once, since the
+    /// pid could be recycled after the child is reaped.
+    pub fn terminate(&mut self) {
+        if self.terminated {
+            return;
+        }
+        self.terminated = true;
+        // Kill the whole group *before* reaping, so any grandchild holding the
+        // slave fd dies and the reader's blocking read unblocks with EOF/EIO.
+        // (`child.id()` is only valid before `wait`.)
+        kill_process_group(self.child.id());
+        let _ = self.child.kill();
+        // Reap, but bounded: a child wedged in uninterruptible (D) state will
+        // not die even on SIGKILL until its I/O completes, and a blind
+        // `wait()` would hang teardown. Poll `try_wait` and give up after a
+        // short budget — there is nothing more we can do for a D-state child.
+        let deadline = Instant::now() + TERMINATE_REAP_BUDGET;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
 }
 
 /// SIGKILLs the entire process group led by `pid`, so sub-processes spawned by
@@ -254,12 +294,8 @@ impl Drop for PtySession {
         //    it exits.
         self.input.take();
 
-        // 2. Kill the whole process group *before* reaping, so any grandchild
-        //    holding the slave fd dies and the reader's blocking read unblocks
-        //    with EOF/EIO. (`child.id()` is only valid before `wait`.)
-        kill_process_group(self.child.id());
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // 2. Kill the whole process group and reap (idempotent).
+        self.terminate();
 
         // 3. Bounded joins: teardown can never hang the host thread.
         if let Some(reader) = self.reader.take() {

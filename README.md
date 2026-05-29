@@ -21,13 +21,14 @@ the output ANSI stream.
   40–120 ms, punctuation/separators 150–300 ms), terminated with a carriage
   return (`\r`).
 - **Output ANSI state machine** — a streaming parser strips ANSI escape
-  sequences in real time and classifies the sanitized stream as `Running`,
-  `ConfirmationPrompt`, or `Idle`. Confirmation prompts (e.g. `[y/n]`) are
-  answered automatically through the input jitterer.
+  sequences in real time. The wrapper classifies the sanitized stream into a
+  `State` (`Running`, `ConfirmationPrompt`, `Idle`); confirmation prompts (e.g.
+  `[y/n]`) are answered automatically through the input jitterer.
 - **Safety watchdogs** — every operation runs under an execution timeout. On
-  timeout the wrapper attempts graceful degradation (`Ctrl+C`, then `SIGKILL`
-  after a grace period) and always restores the host terminal from raw mode
-  back to canonical mode, even on panic.
+  timeout the wrapper attempts graceful degradation: `Ctrl+C`, then `SIGKILL` of
+  the whole process group after a grace period. The interactive front-end that
+  puts the host terminal in raw mode restores it to canonical mode on exit or
+  panic via an RAII guard.
 
 ## Status
 

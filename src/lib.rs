@@ -23,10 +23,12 @@ pub mod ansi;
 pub mod error;
 pub mod jitter;
 pub mod pty;
+pub mod wrapper;
 
 pub use error::{Error, Result};
 pub use jitter::Jitter;
 pub use pty::PtySession;
+pub use wrapper::{Outcome, State, Wrapper, WrapperConfig};
 
 /// Crate version string, sourced from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
