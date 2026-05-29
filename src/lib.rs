@@ -23,12 +23,14 @@ pub mod ansi;
 pub mod error;
 pub mod jitter;
 pub mod pty;
+pub mod screen;
 pub mod terminal;
 pub mod wrapper;
 
 pub use error::{Error, Result};
 pub use jitter::Jitter;
 pub use pty::PtySession;
+pub use screen::Screen;
 pub use terminal::RawModeGuard;
 pub use wrapper::{Outcome, State, Wrapper, WrapperConfig};
 
