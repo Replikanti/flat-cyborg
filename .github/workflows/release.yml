@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# The release is published into *this* repository's Releases using the default
+# GITHUB_TOKEN. Artifacts are not pushed to any front-facing/storefront repo.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: flat-cyborg-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: flat-cyborg-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: flat-cyborg-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: flat-cyborg-macos-aarch64
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross-compilation linker (Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p ~/.cargo
+          {
+            echo '[target.aarch64-unknown-linux-gnu]'
+            echo 'linker = "aarch64-linux-gnu-gcc"'
+          } >> ~/.cargo/config.toml
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/flat-cyborg" "dist/${{ matrix.name }}"
+          chmod +x "dist/${{ matrix.name }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.name }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect binaries
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            cp "$dir"* release/
+          done
+          ls -la release/
+
+      - name: Generate SHA256 checksums
+        working-directory: release
+        run: |
+          shopt -s nullglob
+          for f in flat-cyborg-*; do
+            case "$f" in *.sha256) continue;; esac
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -la
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          PREV_TAG=$(git tag --sort=-v:refname | grep '^v' | sed -n '2p')
+          if [ -n "$PREV_TAG" ]; then
+            CHANGES=$(git log "${PREV_TAG}..${VERSION}" --pretty=format:"- %s" --no-merges | head -50)
+          else
+            CHANGES="Initial release."
+          fi
+          {
+            echo "body<<RELEASE_EOF"
+            echo "## flat-cyborg ${VERSION}"
+            echo ""
+            echo "${CHANGES}"
+            echo ""
+            echo "### Artifacts"
+            echo "Prebuilt binaries for Linux and macOS (x86_64 + aarch64) are attached below, each with a \`.sha256\` checksum."
+            echo "RELEASE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.notes.outputs.body }}
+          files: release/*
+          fail_on_unmatched_files: true
