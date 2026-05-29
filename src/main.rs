@@ -45,6 +45,11 @@ OPTIONS:
     --prompt <TOKEN>    Trailing prompt token for IDLE detection (repeatable;
                         defaults to common shell prompts).
     --no-confirm        Do not auto-answer [y/n] confirmation prompts.
+    --tui               Full-screen TUI mode: capture via a 2D screen grid and
+                        treat a settled screen as idle (for apps using the
+                        alternate screen / cursor addressing). Prints the final
+                        rendered screen instead of the line log. A continuously
+                        animated TUI may never settle — raise --idle-ms for it.
     -h, --help          Print this help.
 
 COMMANDS:
@@ -129,6 +134,7 @@ fn parse_args() -> Result<Mode, String> {
                 config.idle_silence = Duration::from_millis(ms);
             }
             "--no-confirm" => config.auto_confirm = false,
+            "--tui" => config.tui = true,
             other => return Err(format!("unknown option: {other}")),
         }
         i += 1;
@@ -187,6 +193,12 @@ fn run(args: Args) -> flat_cyborg::Result<ExitCode> {
     if !args.cmds.is_empty() {
         orchestrate(session, args)
     } else if rustix::termios::isatty(rustix::stdio::stdin()) {
+        if args.config.tui {
+            eprintln!(
+                "flat-cyborg: --tui has no effect in interactive passthrough mode \
+                 (it applies to --cmd orchestration and piped capture)"
+            );
+        }
         interactive(session)
     } else {
         capture(session, args)
@@ -195,6 +207,7 @@ fn run(args: Args) -> flat_cyborg::Result<ExitCode> {
 
 /// Orchestrator mode: type each command and wait for the target between them.
 fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
+    let tui = args.config.tui;
     let mut wrapper = Wrapper::with_config(session, args.config);
     let mut last = Outcome::Completed;
     for cmd in &args.cmds {
@@ -203,18 +216,28 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
             break;
         }
     }
-    print!("{}", wrapper.clean_log());
-    io::stdout().flush().ok();
+    print_capture(&wrapper, tui);
     Ok(exit_code_for(&mut wrapper, last))
 }
 
 /// Capture mode: run the target to completion, print its sanitized output.
 fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
+    let tui = args.config.tui;
     let mut wrapper = Wrapper::with_config(session, args.config);
     let outcome = wrapper.wait_until_idle()?;
-    print!("{}", wrapper.clean_log());
-    io::stdout().flush().ok();
+    print_capture(&wrapper, tui);
     Ok(exit_code_for(&mut wrapper, outcome))
+}
+
+/// Prints the captured output: the rendered screen in TUI mode, otherwise the
+/// line-oriented sanitized log.
+fn print_capture(wrapper: &Wrapper, tui: bool) {
+    if tui {
+        println!("{}", wrapper.screen_text());
+    } else {
+        print!("{}", wrapper.clean_log());
+    }
+    io::stdout().flush().ok();
 }
 
 /// Maps a terminal [`Outcome`] to a process exit code: the target's own exit

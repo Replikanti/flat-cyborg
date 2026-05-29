@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 use crate::ansi::{is_confirmation_prompt, line_ends_with_any, Sanitizer};
 use crate::error::Result;
 use crate::jitter::Jitter;
-use crate::pty::{Output, PtySession};
+use crate::pty::{Output, PtySession, DEFAULT_COLS, DEFAULT_ROWS};
+use crate::screen::Screen;
 
 /// Tunables for the wrapper's state machine and watchdog.
 #[derive(Debug, Clone)]
@@ -43,6 +44,10 @@ pub struct WrapperConfig {
     pub prompt_tokens: Vec<String>,
     /// Whether to auto-answer confirmation prompts with `y\r`.
     pub auto_confirm: bool,
+    /// Full-screen TUI mode: capture output through a 2D screen grid and treat
+    /// a settled screen (quiet for `idle_silence`) as IDLE, rather than looking
+    /// for a line-oriented trailing prompt.
+    pub tui: bool,
 }
 
 impl Default for WrapperConfig {
@@ -57,6 +62,7 @@ impl Default for WrapperConfig {
                 .map(|s| s.to_string())
                 .collect(),
             auto_confirm: true,
+            tui: false,
         }
     }
 }
@@ -88,6 +94,8 @@ pub enum Outcome {
 pub struct Wrapper {
     session: PtySession,
     sanitizer: Sanitizer,
+    /// 2D screen grid, allocated only in TUI mode.
+    screen: Option<Screen>,
     jitter: Jitter,
     config: WrapperConfig,
     state: State,
@@ -101,9 +109,13 @@ impl Wrapper {
 
     /// Wraps `session` with an explicit configuration.
     pub fn with_config(session: PtySession, config: WrapperConfig) -> Self {
+        // The grid matches the session's default PTY geometry; only needed in
+        // TUI mode.
+        let screen = config.tui.then(|| Screen::new(DEFAULT_ROWS, DEFAULT_COLS));
         Self {
             session,
             sanitizer: Sanitizer::new(),
+            screen,
             jitter: Jitter::new(),
             config,
             state: State::Running,
@@ -125,6 +137,12 @@ impl Wrapper {
         self.sanitizer.clean_log()
     }
 
+    /// The current visible screen rendered as text. Meaningful in `--tui` mode,
+    /// where output is captured through the 2D screen grid; empty otherwise.
+    pub fn screen_text(&self) -> String {
+        self.screen.as_ref().map(Screen::text).unwrap_or_default()
+    }
+
     /// Mutable access to the underlying session.
     pub fn session(&mut self) -> &mut PtySession {
         &mut self.session
@@ -136,6 +154,14 @@ impl Wrapper {
     /// # Errors
     /// Returns an error if writing the command to the master fails.
     pub fn run_command(&mut self, command: &str) -> Result<Outcome> {
+        if self.config.tui {
+            // Let the TUI finish its current render and become ready for input
+            // before typing, so keystrokes are not dropped during a redraw.
+            match self.wait_until_idle()? {
+                Outcome::Idle => {}
+                other => return Ok(other),
+            }
+        }
         self.send(command)?;
         self.wait_until_idle()
     }
@@ -170,6 +196,9 @@ impl Wrapper {
         // prompts, and even when the intervening output coalesces into a single
         // read so the non-prompt state is never observed on its own.
         let mut answered_at: Option<usize> = None;
+        // TUI settle detection must not fire before the screen has rendered at
+        // least once.
+        let mut saw_output = false;
         self.state = State::Running;
 
         loop {
@@ -190,48 +219,66 @@ impl Wrapper {
 
             match self.session.read_output(self.config.poll_interval) {
                 Output::Data(chunk) => {
-                    if self.sanitizer.feed(&chunk) {
+                    saw_output = true;
+                    // The line sanitizer is always maintained (so `clean_log`
+                    // works); the screen grid only in TUI mode.
+                    let sani_changed = self.sanitizer.feed(&chunk);
+                    let changed = if self.config.tui {
+                        self.screen.as_mut().is_some_and(|s| s.feed(&chunk))
+                    } else {
+                        sani_changed
+                    };
+                    if changed {
                         last_activity = Instant::now();
                         self.state = State::Running;
                     }
-                    let line = self.sanitizer.current_line();
-                    if is_confirmation_prompt(&line) {
-                        self.state = State::ConfirmationPrompt;
-                        let prompt_id = self.sanitizer.committed_lines();
-                        if self.config.auto_confirm
-                            && interrupted_at.is_none()
-                            && answered_at != Some(prompt_id)
-                        {
-                            // Reply `y\r` through the jitter layer (per spec).
-                            let session = &self.session;
-                            self.jitter
-                                .type_command("y", |bytes| session.write_input(bytes))?;
-                            answered_at = Some(prompt_id);
-                            last_activity = Instant::now();
-                            // The jittered reply may have slept; re-check the
-                            // deadline so it cannot push the first escalation
-                            // past `exec_timeout`.
-                            if start.elapsed() >= self.config.exec_timeout {
-                                let _ = self.session.write_input(&[0x03]);
-                                interrupted_at = Some(Instant::now());
+                    // Confirmation auto-reply is line-oriented; in TUI mode the
+                    // prompts are usually full-screen menus, so it is skipped.
+                    if !self.config.tui {
+                        let line = self.sanitizer.current_line();
+                        if is_confirmation_prompt(&line) {
+                            self.state = State::ConfirmationPrompt;
+                            let prompt_id = self.sanitizer.committed_lines();
+                            if self.config.auto_confirm
+                                && interrupted_at.is_none()
+                                && answered_at != Some(prompt_id)
+                            {
+                                // Reply `y\r` through the jitter layer (per spec).
+                                let session = &self.session;
+                                self.jitter
+                                    .type_command("y", |bytes| session.write_input(bytes))?;
+                                answered_at = Some(prompt_id);
+                                last_activity = Instant::now();
+                                // The jittered reply may have slept; re-check the
+                                // deadline so it cannot push the first escalation
+                                // past `exec_timeout`.
+                                if start.elapsed() >= self.config.exec_timeout {
+                                    let _ = self.session.write_input(&[0x03]);
+                                    interrupted_at = Some(Instant::now());
+                                }
                             }
                         }
                     }
                 }
                 Output::Idle => {
-                    // Silence: IDLE iff the trailing prompt is on the current
-                    // (uncommitted) line and we have been quiet long enough and
-                    // we are not mid-abort.
+                    // Silence long enough, and not mid-abort.
                     if interrupted_at.is_none()
                         && last_activity.elapsed() >= self.config.idle_silence
                     {
-                        let tokens: Vec<&str> = self
-                            .config
-                            .prompt_tokens
-                            .iter()
-                            .map(String::as_str)
-                            .collect();
-                        if line_ends_with_any(&self.sanitizer.current_line(), &tokens) {
+                        let idle = if self.config.tui {
+                            // A settled screen is IDLE for a full-screen TUI;
+                            // there is no line prompt to match.
+                            saw_output
+                        } else {
+                            let tokens: Vec<&str> = self
+                                .config
+                                .prompt_tokens
+                                .iter()
+                                .map(String::as_str)
+                                .collect();
+                            line_ends_with_any(&self.sanitizer.current_line(), &tokens)
+                        };
+                        if idle {
                             self.state = State::Idle;
                             return Ok(Outcome::Idle);
                         }
@@ -263,6 +310,34 @@ mod tests {
         let mut w = Wrapper::with_config(session, config);
         w.set_jitter(instant_jitter());
         w
+    }
+
+    #[test]
+    fn tui_mode_settles_drives_and_captures_the_screen() {
+        // A minimal full-screen TUI: enter the alternate screen, paint a prompt
+        // with absolute cursor addressing, read a line, then paint the answer.
+        let config = WrapperConfig {
+            tui: true,
+            idle_silence: Duration::from_millis(300),
+            exec_timeout: Duration::from_secs(20),
+            poll_interval: Duration::from_millis(50),
+            ..WrapperConfig::default()
+        };
+        let script = "printf '\\033[?1049h\\033[2J\\033[1;1HREADY'; \
+                      read x; \
+                      printf '\\033[3;1HGOT=%s' \"$x\"; \
+                      sleep 0.4";
+        let mut w = wrapper("sh", &["-c", script], config);
+
+        let outcome = w.run_command("ping").expect("run");
+        assert_eq!(outcome, Outcome::Idle);
+        let screen = w.screen_text();
+        assert!(screen.contains("READY"), "screen: {screen:?}");
+        assert!(
+            screen.contains("GOT=ping"),
+            "TUI did not receive the typed input; screen: {screen:?}"
+        );
+        // Dropping `w` terminates the lingering `sleep`.
     }
 
     #[test]

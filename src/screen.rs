@@ -180,7 +180,6 @@ pub struct Screen {
     alternate: Grid,
     in_alternate: bool,
     saved_cursor: (usize, usize),
-    changed: bool,
 }
 
 impl Screen {
@@ -194,7 +193,6 @@ impl Screen {
             alternate: Grid::new(rows, cols),
             in_alternate: false,
             saved_cursor: (0, 0),
-            changed: false,
         }
     }
 
@@ -206,10 +204,16 @@ impl Screen {
         }
     }
 
-    /// Feeds a chunk of raw bytes, returning `true` if the visible screen
-    /// changed (used to detect when a TUI has settled).
+    /// Feeds a chunk of raw bytes, returning `true` if the *visible content*
+    /// changed.
+    ///
+    /// Change is detected by diffing a hash of the screen cells before and
+    /// after, not by "did any write happen". This is what makes settle
+    /// detection robust: a TUI that repaints identical content on a timer
+    /// (clocks, progress bars, same-frame redraws) or merely moves/blinks the
+    /// cursor is correctly reported as unchanged, so it can settle.
     pub fn feed(&mut self, input: &[u8]) -> bool {
-        self.changed = false;
+        let before = self.content_hash();
         // Drive the parser; it calls back into `self` via `Perform`. Use a
         // temporary to satisfy the borrow checker (parser is a field).
         let mut parser = std::mem::take(&mut self.parser);
@@ -217,7 +221,25 @@ impl Screen {
             parser.advance(self, b);
         }
         self.parser = parser;
-        self.changed
+        self.content_hash() != before
+    }
+
+    /// Hash of the visible screen's cells. The cursor position is deliberately
+    /// excluded, so cursor motion and blinking do not count as a change.
+    fn content_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let grid = if self.in_alternate {
+            &self.alternate
+        } else {
+            &self.primary
+        };
+        for row in &grid.cells {
+            for c in row {
+                c.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
     }
 
     /// The current visible screen rendered as text.
@@ -233,18 +255,12 @@ impl Screen {
 impl Perform for Screen {
     fn print(&mut self, c: char) {
         self.active().put(c);
-        self.changed = true;
     }
 
     fn execute(&mut self, byte: u8) {
-        // Only content-affecting operations mark the screen changed. Pure
-        // cursor moves (CR/BS/HT) do not, so settle detection is not defeated
-        // by cursor churn — mirroring the line Sanitizer's policy.
         match byte {
             b'\n' => {
-                if self.active().line_feed() {
-                    self.changed = true; // a scroll is a visible change
-                }
+                self.active().line_feed();
             }
             b'\r' => self.active().carriage_return(),
             0x08 => self.active().backspace(),
@@ -269,14 +285,12 @@ impl Perform for Screen {
                             self.alternate.clear();
                         }
                         self.in_alternate = true;
-                        self.changed = true;
                     } else if !enter && self.in_alternate {
                         self.in_alternate = false;
                         if p == 1049 {
                             let (r, c) = self.saved_cursor;
                             self.primary.move_to(r, c);
                         }
-                        self.changed = true;
                     }
                 }
             }
@@ -330,15 +344,8 @@ impl Perform for Screen {
                 let (r, c) = self.active().decsc;
                 self.active().move_to(r, c);
             }
-            // Erases — content change.
-            b'J' => {
-                self.active().erase_display(p0);
-                self.changed = true;
-            }
-            b'K' => {
-                self.active().erase_line(p0);
-                self.changed = true;
-            }
+            b'J' => self.active().erase_display(p0),
+            b'K' => self.active().erase_line(p0),
             // SGR and anything else affect rendering only.
             _ => {}
         }
@@ -430,15 +437,19 @@ mod tests {
     }
 
     #[test]
-    fn pure_cursor_moves_do_not_mark_changed() {
-        // Settle detection must not be defeated by cursor-only churn.
+    fn content_diff_ignores_cursor_only_and_idempotent_repaints() {
         let mut s = Screen::new(5, 20);
-        assert!(s.feed(b"hello")); // content
+        assert!(s.feed(b"hello")); // content appeared
         assert!(!s.feed(b"\r")); // CR — cursor only
-        assert!(!s.feed(b"\x1b[3;3H")); // CUP — cursor only
         assert!(!s.feed(b"\x1b[2C")); // CUF — cursor only
         assert!(!s.feed(b"\x08")); // BS — cursor only
-        assert!(s.feed(b"\x1b[K")); // erase — content
+                                   // Repainting the exact same content is NOT a change (lets a
+                                   // timer-repaint TUI settle).
+        assert!(!s.feed(b"\x1b[1;1Hhello"));
+        // Erasing the line that holds content IS a change.
+        assert!(s.feed(b"\x1b[1;1H\x1b[2K"));
+        // Erasing an already-blank line is NOT a change.
+        assert!(!s.feed(b"\x1b[3;1H\x1b[2K"));
     }
 
     #[test]
