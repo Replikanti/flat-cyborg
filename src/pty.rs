@@ -2,22 +2,29 @@
 //!
 //! [`PtySession`] allocates a native pseudo-terminal (master/slave pair) with
 //! a fixed geometry, spawns the Target CLI as a child process attached to the
-//! slave end, and multiplexes the master end's I/O without an async runtime: a
-//! dedicated reader thread drains the master into a channel, while the caller
-//! writes to the master directly.
+//! slave end, and multiplexes the master end's I/O without an async runtime.
+//! Two dedicated std threads do the blocking work so the caller's thread never
+//! blocks on the PTY:
+//!
+//! - a **reader** thread drains the master into a channel;
+//! - a **writer** thread writes queued input to the master.
+//!
+//! The caller enqueues input with [`PtySession::write_input`] (non-blocking)
+//! and polls output with [`PtySession::read_output`] (bounded by a timeout).
 //!
 //! The child fully inherits the current working directory and environment of
 //! the host process; only `TERM` is forced to `xterm-256color` so the target
 //! detects a fully-featured terminal and launches in interactive mode.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use std::ffi::OsStr;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::process::Child;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::Duration;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use pty_process::blocking::Pty;
 use pty_process::Size;
@@ -32,6 +39,12 @@ pub const TERM: &str = "xterm-256color";
 /// Size of the reader thread's read buffer, in bytes.
 const READ_CHUNK: usize = 8192;
 
+/// Upper bound on how long [`Drop`] waits for the reader thread to finish
+/// before detaching it, so teardown can never hang the host thread.
+const READER_JOIN_BUDGET: Duration = Duration::from_secs(2);
+/// Upper bound on how long [`Drop`] waits for the writer thread.
+const WRITER_JOIN_BUDGET: Duration = Duration::from_secs(1);
+
 /// The result of polling the PTY for output.
 #[derive(Debug)]
 pub enum Output {
@@ -41,24 +54,26 @@ pub enum Output {
     /// running silently or waiting at a prompt).
     Idle,
     /// The master reached end-of-stream: the child closed the slave (it has
-    /// exited or is about to).
+    /// exited, or is about to). Any buffered output is delivered as `Data`
+    /// before this is reported.
     Eof,
 }
 
 /// An interactive Target CLI running inside a pseudo-terminal.
 ///
-/// I/O is multiplexed with std threads rather than an async runtime. A reader
-/// thread continuously reads the PTY master and forwards chunks over a channel;
-/// the caller writes input to the master directly via [`PtySession::write_input`]
-/// and polls output via [`PtySession::read_output`].
+/// I/O is multiplexed with std threads rather than an async runtime, so neither
+/// reading nor writing ever blocks the caller's thread.
 pub struct PtySession {
-    /// The master end, shared between the writer (this handle) and the reader
-    /// thread. The PTY is full-duplex, so concurrent read/write on the shared
-    /// file descriptor is safe.
-    pty: Arc<Pty>,
-    child: Child,
+    /// Sender into the writer thread. Wrapped in `Option` so [`Drop`] can drop
+    /// it early, signalling the writer thread to exit.
+    input: Option<Sender<Vec<u8>>>,
     output: Receiver<Vec<u8>>,
+    child: Child,
     reader: Option<JoinHandle<()>>,
+    writer: Option<JoinHandle<()>>,
+    /// Set once the output channel disconnects, so repeated polling after EOF
+    /// honors the timeout instead of busy-spinning.
+    eof: AtomicBool,
 }
 
 impl PtySession {
@@ -96,66 +111,103 @@ impl PtySession {
 
         // `pty_process::blocking::Command` wraps `std::process::Command`, which
         // inherits the parent CWD and environment by default. We only set TERM.
+        // The child is made a session leader (it gets the slave as controlling
+        // terminal), so its process-group id equals its pid — see `Drop`.
         let child = pty_process::blocking::Command::new(program)
             .args(args)
             .env("TERM", TERM)
             .spawn(pts)?;
 
+        // `Read`/`Write` are implemented for `&Pty`, so the two threads can
+        // share the master via `Arc` without any interior mutability. The PTY
+        // is full-duplex, so concurrent read and write on the fd are safe.
         let pty = Arc::new(pty);
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
         let reader_pty = Arc::clone(&pty);
-        let reader = std::thread::spawn(move || {
-            // `Read` is implemented for `&Pty`, so the shared handle is read
-            // without any interior mutability.
+        let reader = thread::spawn(move || {
             let mut handle: &Pty = &reader_pty;
             let mut buf = [0u8; READ_CHUNK];
             loop {
                 match handle.read(&mut buf) {
                     Ok(0) => break, // clean EOF
                     Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
+                        if out_tx.send(buf[..n].to_vec()).is_err() {
                             break; // receiver dropped
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     // On Linux, reading the master after the slave closes
-                    // surfaces as EIO rather than a clean EOF. Treat any other
-                    // error as end-of-stream.
+                    // surfaces as EIO, which is the expected end-of-stream
+                    // signal here. Any other error is also terminal for the
+                    // stream, so we stop reading in every error case.
                     Err(_) => break,
                 }
             }
         });
 
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>();
+        let writer_pty = Arc::clone(&pty);
+        let writer = thread::spawn(move || {
+            let mut handle: &Pty = &writer_pty;
+            // Exits when the input channel is dropped (Disconnected) or a write
+            // fails (the child closed the slave).
+            while let Ok(bytes) = in_rx.recv() {
+                if handle.write_all(&bytes).is_err() {
+                    break;
+                }
+                let _ = handle.flush();
+            }
+        });
+
         Ok(Self {
-            pty,
+            input: Some(in_tx),
+            output: out_rx,
             child,
-            output: rx,
             reader: Some(reader),
+            writer: Some(writer),
+            eof: AtomicBool::new(false),
         })
     }
 
-    /// Writes raw bytes to the PTY master (the child's stdin) and flushes.
+    /// Queues raw bytes to be written to the PTY master (the child's stdin).
+    ///
+    /// This only enqueues; the dedicated writer thread performs the blocking
+    /// write, so the caller never blocks even if the child has stopped reading.
     ///
     /// # Errors
-    /// Returns an error if the write or flush fails.
+    /// Returns an error if the writer thread has terminated.
     pub fn write_input(&self, bytes: &[u8]) -> Result<()> {
-        let mut handle: &Pty = &self.pty;
-        handle.write_all(bytes)?;
-        handle.flush()?;
-        Ok(())
+        let tx = self.input.as_ref().ok_or_else(|| {
+            Error::Io(io::Error::new(io::ErrorKind::BrokenPipe, "session closed"))
+        })?;
+        tx.send(bytes.to_vec()).map_err(|_| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "pty writer thread terminated",
+            ))
+        })
     }
 
     /// Waits up to `timeout` for the next chunk of output from the master.
     ///
     /// Returns [`Output::Data`] if bytes arrived, [`Output::Idle`] if the
     /// timeout elapsed with no output, or [`Output::Eof`] once the child has
-    /// closed the slave end.
+    /// closed the slave end. After the first `Eof`, subsequent calls still
+    /// honor `timeout` (they sleep rather than returning instantly), so a poll
+    /// loop that keeps calling after EOF will not busy-spin.
     pub fn read_output(&self, timeout: Duration) -> Output {
+        if self.eof.load(Ordering::Acquire) {
+            thread::sleep(timeout);
+            return Output::Eof;
+        }
         match self.output.recv_timeout(timeout) {
             Ok(chunk) => Output::Data(chunk),
             Err(RecvTimeoutError::Timeout) => Output::Idle,
-            Err(RecvTimeoutError::Disconnected) => Output::Eof,
+            Err(RecvTimeoutError::Disconnected) => {
+                self.eof.store(true, Ordering::Release);
+                Output::Eof
+            }
         }
     }
 
@@ -170,15 +222,51 @@ impl PtySession {
     }
 }
 
+/// SIGKILLs the entire process group led by `pid`, so sub-processes spawned by
+/// the Target CLI (which share its process group via the controlling terminal)
+/// are terminated too — not just the direct child.
+fn kill_process_group(pid: u32) {
+    if let Some(p) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process_group(p, rustix::process::Signal::KILL);
+    }
+}
+
+/// Joins `handle`, but gives up after `budget` and detaches the thread instead
+/// of blocking forever. Teardown correctness never depends on a thread that
+/// refuses to exit.
+fn join_bounded(handle: JoinHandle<()>, budget: Duration) {
+    let start = Instant::now();
+    while !handle.is_finished() {
+        if start.elapsed() >= budget {
+            return; // detach rather than hang
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let _ = handle.join();
+}
+
 impl Drop for PtySession {
     fn drop(&mut self) {
-        // Guarantee the child does not outlive the session. Killing it closes
-        // the slave, which unblocks the reader thread (EIO/EOF) so it can be
-        // joined without hanging.
+        // 1. Drop the input channel so the writer thread's `recv` returns and
+        //    it exits.
+        self.input.take();
+
+        // 2. Kill the whole process group *before* reaping, so any grandchild
+        //    holding the slave fd dies and the reader's blocking read unblocks
+        //    with EOF/EIO. (`child.id()` is only valid before `wait`.)
+        kill_process_group(self.child.id());
         let _ = self.child.kill();
         let _ = self.child.wait();
+
+        // 3. Bounded joins: teardown can never hang the host thread.
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            join_bounded(reader, READER_JOIN_BUDGET);
+        }
+        if let Some(writer) = self.writer.take() {
+            join_bounded(writer, WRITER_JOIN_BUDGET);
         }
     }
 }
@@ -186,7 +274,6 @@ impl Drop for PtySession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     /// Drains output until `needle` is seen or `deadline` passes.
     fn read_until(session: &PtySession, needle: &str, deadline: Duration) -> String {
@@ -235,29 +322,72 @@ mod tests {
     fn input_written_to_master_reaches_target() {
         // `cat` echoes its stdin back; prove the write path drives the child.
         let session = PtySession::spawn("cat", std::iter::empty::<&str>()).expect("spawn cat");
-        session.write_input(b"ping\r").expect("write to master");
+        session.write_input(b"ping\r").expect("queue input");
         let out = read_until(&session, "ping", Duration::from_secs(5));
         assert!(
             out.contains("ping"),
             "did not observe echoed input: {out:?}"
         );
-        // `session` is dropped here, which kills `cat` and joins the reader.
+        // `session` is dropped here, which kills `cat` and joins both threads.
     }
 
     #[test]
     fn reports_eof_after_child_exits() {
         let session = PtySession::spawn("sh", ["-c", "echo bye"]).expect("spawn");
-        let mut saw_eof = false;
         let start = Instant::now();
+        let mut saw_eof = false;
         while start.elapsed() < Duration::from_secs(5) {
-            match session.read_output(Duration::from_millis(200)) {
-                Output::Eof => {
-                    saw_eof = true;
-                    break;
-                }
-                _ => continue,
+            if let Output::Eof = session.read_output(Duration::from_millis(200)) {
+                saw_eof = true;
+                break;
             }
         }
         assert!(saw_eof, "expected EOF after the child exited");
+    }
+
+    #[test]
+    fn polling_after_eof_honors_timeout() {
+        // Regression: after EOF the channel is disconnected; a naive
+        // `recv_timeout` returns instantly and a poll loop busy-spins. The
+        // sticky-EOF path must sleep for the requested timeout instead.
+        let session = PtySession::spawn("sh", ["-c", "echo bye"]).expect("spawn");
+        // Reach EOF first.
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if let Output::Eof = session.read_output(Duration::from_millis(100)) {
+                break;
+            }
+        }
+        // A subsequent poll must take roughly the timeout, not return instantly.
+        let t = Instant::now();
+        assert!(matches!(
+            session.read_output(Duration::from_millis(300)),
+            Output::Eof
+        ));
+        assert!(
+            t.elapsed() >= Duration::from_millis(250),
+            "post-EOF poll returned too fast ({:?}); it is busy-spinning",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn drop_does_not_hang_with_surviving_grandchild() {
+        // Regression for the QA blocker: the shell backgrounds a long sleep
+        // (a grandchild sharing the process group) and waits on it. Dropping
+        // the session must SIGKILL the whole group and return promptly, not
+        // hang on the reader thread because the grandchild keeps the slave open.
+        let session =
+            PtySession::spawn("sh", ["-c", "sleep 300 & echo STARTED; wait"]).expect("spawn");
+        let out = read_until(&session, "STARTED", Duration::from_secs(5));
+        assert!(out.contains("STARTED"), "target did not start: {out:?}");
+
+        let start = Instant::now();
+        drop(session);
+        assert!(
+            start.elapsed() < READER_JOIN_BUDGET + Duration::from_secs(1),
+            "Drop hung for {:?}",
+            start.elapsed()
+        );
     }
 }

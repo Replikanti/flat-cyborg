@@ -23,6 +23,7 @@ name = "flat-cyborg"
 version = "0.1.0"
 dependencies = [
  "pty-process",
+ "rustix",
 ]
 
 [[package]]
