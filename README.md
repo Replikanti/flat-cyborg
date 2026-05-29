@@ -35,6 +35,19 @@ the output ANSI stream.
 Early development. Components land incrementally via trunk-based development;
 see the open pull requests and the issue tracker for the current state.
 
+## Installing
+
+Install the latest release binary for your platform (Linux/macOS, x86_64 or
+aarch64). The script verifies the SHA256 checksum and installs to
+`/usr/local/bin` (override with `FLAT_CYBORG_INSTALL_DIR`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Replikanti/flat-cyborg/main/install.sh | sh
+```
+
+Prefer to inspect first? Download `install.sh`, read it, then run it — or grab a
+binary and its `.sha256` directly from the [releases page](https://github.com/Replikanti/flat-cyborg/releases).
+
 ## Building
 
 ```sh
