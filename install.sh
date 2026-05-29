@@ -92,12 +92,27 @@ if [ ! -s "$TMPFILE" ]; then
   exit 1
 fi
 
-# Verify the SHA256 checksum when possible.
+# Verify the SHA256 checksum. This fails closed: a missing checksum file or a
+# missing sha256 tool aborts the install, since this script is meant to be run
+# as `curl ... | sh` (often with sudo) and an unverified binary is the prime
+# attack target. Set FLAT_CYBORG_INSECURE=1 to install without verification.
+INSECURE="${FLAT_CYBORG_INSECURE:-0}"
+insecure_skip() {
+  # $1: reason
+  if [ "$INSECURE" = "1" ]; then
+    echo "Warning: $1; installing WITHOUT verification (FLAT_CYBORG_INSECURE=1)" >&2
+  else
+    echo "Error: $1." >&2
+    echo "Refusing to install an unverified binary. Re-run with FLAT_CYBORG_INSECURE=1 to override." >&2
+    exit 1
+  fi
+}
+
 if fetch "${BASE_URL}/${BINARY}.sha256" "$SUMFILE" 2>/dev/null && [ -s "$SUMFILE" ]; then
   EXPECTED=$(awk '{print $1}' "$SUMFILE")
   ACTUAL=$(sha256_of "$TMPFILE")
   if [ -z "$ACTUAL" ]; then
-    echo "Warning: no sha256 tool found; skipping checksum verification" >&2
+    insecure_skip "no sha256 tool (sha256sum/shasum) found"
   elif [ "$EXPECTED" != "$ACTUAL" ]; then
     echo "Error: checksum mismatch for $BINARY" >&2
     echo "  expected: $EXPECTED" >&2
@@ -107,14 +122,28 @@ if fetch "${BASE_URL}/${BINARY}.sha256" "$SUMFILE" 2>/dev/null && [ -s "$SUMFILE
     echo "Checksum verified."
   fi
 else
-  echo "Warning: checksum file unavailable; skipping verification" >&2
+  insecure_skip "checksum file ${BINARY}.sha256 unavailable"
 fi
 
 chmod +x "$TMPFILE"
 
+# True when $INSTALL_DIR can be created/written without sudo, i.e. its nearest
+# existing ancestor is writable. Walking up (rather than checking only one
+# level) avoids a needless sudo prompt for a deep custom install dir under a
+# writable root.
+can_install_without_sudo() {
+  d="$1"
+  while [ ! -e "$d" ]; do
+    parent=$(dirname "$d")
+    [ "$parent" = "$d" ] && break
+    d="$parent"
+  done
+  [ -w "$d" ]
+}
+
 # Install (create the directory if needed, use sudo only if required).
 DEST="$INSTALL_DIR/flat-cyborg"
-if [ -w "$INSTALL_DIR" ] || [ -w "$(dirname "$INSTALL_DIR")" ]; then
+if can_install_without_sudo "$INSTALL_DIR"; then
   mkdir -p "$INSTALL_DIR"
   mv "$TMPFILE" "$DEST"
 else
