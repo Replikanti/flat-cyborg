@@ -26,11 +26,15 @@ use std::time::Duration;
 use flat_cyborg::pty::Output;
 use flat_cyborg::{Outcome, PtySession, RawModeGuard, Wrapper, WrapperConfig};
 
+mod update;
+
 const HELP: &str = "\
 flat-cyborg — asynchronous PTY wrapper
 
 USAGE:
     flat-cyborg [OPTIONS] -- <program> [args...]
+    flat-cyborg update [--check]
+    flat-cyborg version
 
 OPTIONS:
     --cmd <TEXT>        Type TEXT into the target (repeatable). Selects
@@ -42,6 +46,10 @@ OPTIONS:
                         defaults to common shell prompts).
     --no-confirm        Do not auto-answer [y/n] confirmation prompts.
     -h, --help          Print this help.
+
+COMMANDS:
+    update [--check]    Self-update to the latest release (--check only reports).
+    version             Print the version.
 
 With no --cmd, a terminal stdin starts interactive passthrough; a piped stdin
 runs the target to completion and prints its sanitized output.
@@ -125,6 +133,19 @@ fn parse_args() -> Result<Option<Args>, String> {
 }
 
 fn main() -> ExitCode {
+    // Subcommands are dispatched before wrapper-argument parsing. They only fire
+    // when they are the first token; to wrap a program literally named `update`
+    // or `version`, use the `--` form (e.g. `flat-cyborg -- update`).
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
+        Some("update") => return update::cmd_update(&argv[1..]),
+        Some("version") | Some("--version") | Some("-V") => {
+            println!("flat-cyborg {}", flat_cyborg::VERSION);
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
+
     let args = match parse_args() {
         Ok(None) => {
             print!("{HELP}");
