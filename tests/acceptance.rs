@@ -63,17 +63,11 @@ fn sanitized_output_has_no_ansi_or_spinner_artifacts() {
         !log.contains('\u{1b}'),
         "ANSI escape leaked into log: {log:?}"
     );
-    assert!(log.contains("ERROR text"), "log: {log:?}");
-    assert!(log.contains("FINISHED"), "log: {log:?}");
-    // The intermediate spinner frames collapsed away.
-    assert!(
-        !log.contains("working|"),
-        "spinner artifact survived: {log:?}"
-    );
-    assert!(
-        !log.contains("working/"),
-        "spinner artifact survived: {log:?}"
-    );
+    // Exact-equality: the colored line is stripped to plain text and every
+    // spinner frame collapses to the final one. This would fail (leaving a
+    // `working|`/`working/`/`working-` artifact) if the erase/overwrite
+    // handling regressed — not just if a substring happened to be absent.
+    assert_eq!(log, "ERROR text\nFINISHED\n", "unexpected sanitized log");
 }
 
 /// Criterion 3: I/O is asynchronous and non-blocking — early output is readable
@@ -101,6 +95,13 @@ fn output_streams_without_blocking() {
     assert!(
         seen.contains("FIRST"),
         "did not stream early output: {seen:?}"
+    );
+    // Structural proof of streaming: FIRST was observed while the target was
+    // still sleeping, before SECOND was emitted — reads do not block until the
+    // process completes.
+    assert!(
+        !seen.contains("SECOND"),
+        "SECOND arrived with FIRST; output was not streamed incrementally: {seen:?}"
     );
     assert!(
         start.elapsed() < Duration::from_millis(1500),

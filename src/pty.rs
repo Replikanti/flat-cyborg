@@ -230,6 +230,30 @@ impl PtySession {
         self.child.id()
     }
 
+    /// Waits up to `budget` for the child to exit and returns its status.
+    ///
+    /// On success the child has been reaped, so this marks the session
+    /// terminated — [`Drop`] will then skip signalling (the pid could be
+    /// recycled). Returns `None` if the child has not exited within `budget`.
+    pub fn wait_with_timeout(&mut self, budget: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.terminated = true;
+                    return Some(status);
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// Mutable access to the child process handle (for signalling / waiting).
     pub fn child(&mut self) -> &mut Child {
         &mut self.child

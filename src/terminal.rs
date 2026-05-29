@@ -2,8 +2,15 @@
 //!
 //! When the wrapper is driven interactively it puts the host terminal into raw
 //! mode so keystrokes reach the Target CLI verbatim. [`RawModeGuard`] performs
-//! that switch and, crucially, restores the terminal to its original (canonical)
-//! settings when it is dropped — including during stack unwinding from a panic.
+//! that switch and restores the terminal to its original (canonical) settings
+//! when it is dropped — on normal scope exit and during stack unwinding from a
+//! panic.
+//!
+//! Restoration is `Drop`-based, so it covers normal exit and panic-unwind but
+//! **not** termination that skips destructors: an uncaught fatal signal
+//! (`SIGKILL`, `SIGTERM`, ...) or `panic = "abort"`. A long-lived interactive
+//! tool that must survive those would additionally install signal handlers;
+//! this demo front-end relies on `Drop`.
 //!
 //! The guard owns a duplicate of the terminal file descriptor, so restoration
 //! does not depend on the original handle still being around, and dropping the
@@ -41,12 +48,13 @@ impl RawModeGuard {
             return Ok(None);
         }
         let original = tcgetattr(fd)?;
+        // Own a duplicate *before* changing any modes, so that if duplication
+        // fails we return an error with the terminal still untouched (no raw
+        // mode left set without a guard to restore it).
+        let owned = fd.try_clone_to_owned()?;
         let mut raw = original.clone();
         raw.make_raw();
         tcsetattr(fd, OptionalActions::Now, &raw)?;
-        // Own a duplicate so restoration does not depend on the borrowed fd's
-        // lifetime, and dropping the guard does not close the caller's fd.
-        let owned = fd.try_clone_to_owned()?;
         Ok(Some(Self {
             fd: owned,
             original,
@@ -111,6 +119,29 @@ mod tests {
         assert!(
             after.local_modes.contains(LocalModes::ICANON),
             "dropping the guard should restore canonical mode"
+        );
+    }
+
+    #[test]
+    fn raw_mode_is_restored_on_panic_unwind() {
+        let (_pty, pts) = pty_process::blocking::open().expect("open pty");
+        let pts = std::sync::Arc::new(pts);
+
+        let pts_inner = std::sync::Arc::clone(&pts);
+        let result = std::panic::catch_unwind(move || {
+            let _guard = RawModeGuard::new(&*pts_inner)
+                .expect("new")
+                .expect("is a tty");
+            let during = tcgetattr(&*pts_inner).expect("tcgetattr during");
+            assert!(!during.local_modes.contains(LocalModes::ICANON));
+            panic!("boom"); // guard's Drop must run during unwind
+        });
+        assert!(result.is_err(), "the closure should have panicked");
+
+        let after = tcgetattr(&*pts).expect("tcgetattr after");
+        assert!(
+            after.local_modes.contains(LocalModes::ICANON),
+            "canonical mode should be restored even when the scope panics"
         );
     }
 }

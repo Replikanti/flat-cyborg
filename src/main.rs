@@ -56,11 +56,19 @@ struct Args {
 
 fn parse_args() -> Result<Option<Args>, String> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    if raw.iter().any(|a| a == "-h" || a == "--help") {
+
+    // Split on the first `--` first, so `-h`/`--help` is only honored when it
+    // belongs to flat-cyborg (before `--`), never when it is an argument to the
+    // target program.
+    let split = raw.iter().position(|a| a == "--");
+    let opts_slice = match split {
+        Some(s) => &raw[..s],
+        None => &raw[..],
+    };
+    if opts_slice.iter().any(|a| a == "-h" || a == "--help") {
         return Ok(None);
     }
 
-    let split = raw.iter().position(|a| a == "--");
     let Some(split) = split else {
         return Err("missing `--` separator before the target program".into());
     };
@@ -154,20 +162,16 @@ fn run(args: Args) -> flat_cyborg::Result<ExitCode> {
 /// Orchestrator mode: type each command and wait for the target between them.
 fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     let mut wrapper = Wrapper::with_config(session, args.config);
-    let mut timed_out = false;
+    let mut last = Outcome::Completed;
     for cmd in &args.cmds {
-        if wrapper.run_command(cmd)? == Outcome::TimedOut {
-            timed_out = true;
+        last = wrapper.run_command(cmd)?;
+        if last == Outcome::TimedOut {
             break;
         }
     }
     print!("{}", wrapper.clean_log());
     io::stdout().flush().ok();
-    Ok(if timed_out {
-        ExitCode::from(124) // conventional timeout exit code
-    } else {
-        ExitCode::SUCCESS
-    })
+    Ok(exit_code_for(&mut wrapper, last))
 }
 
 /// Capture mode: run the target to completion, print its sanitized output.
@@ -176,10 +180,27 @@ fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     let outcome = wrapper.wait_until_idle()?;
     print!("{}", wrapper.clean_log());
     io::stdout().flush().ok();
-    Ok(match outcome {
+    Ok(exit_code_for(&mut wrapper, outcome))
+}
+
+/// Maps a terminal [`Outcome`] to a process exit code: the target's own exit
+/// status when it completed, `124` on watchdog timeout, `0` when it merely
+/// returned to an idle prompt (our commands ran; the target is still alive).
+fn exit_code_for(wrapper: &mut Wrapper, outcome: Outcome) -> ExitCode {
+    match outcome {
         Outcome::TimedOut => ExitCode::from(124),
-        _ => ExitCode::SUCCESS,
-    })
+        Outcome::Idle => ExitCode::SUCCESS,
+        Outcome::Completed => {
+            let code = wrapper
+                .session()
+                .wait_with_timeout(Duration::from_secs(2))
+                .and_then(|status| status.code());
+            match code {
+                Some(c) => ExitCode::from(c.clamp(0, 255) as u8),
+                None => ExitCode::FAILURE, // killed by signal / unknown
+            }
+        }
+    }
 }
 
 /// Interactive mode: forward host keystrokes to the target and mirror its raw
