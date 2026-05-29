@@ -241,11 +241,9 @@ impl Perform for Screen {
         // cursor moves (CR/BS/HT) do not, so settle detection is not defeated
         // by cursor churn — mirroring the line Sanitizer's policy.
         match byte {
-            b'\n' => {
-                if self.active().line_feed() {
-                    self.changed = true; // a scroll is a visible change
-                }
-            }
+            // A scroll (line_feed returning true) is a visible content change;
+            // a plain cursor-down is not.
+            b'\n' => self.changed |= self.active().line_feed(),
             b'\r' => self.active().carriage_return(),
             0x08 => self.active().backspace(),
             b'\t' => self.active().tab(),
