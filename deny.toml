@@ -10,16 +10,15 @@ ignore = []
 
 [licenses]
 version = 2
-# Permissive licenses compatible with this crate's MIT OR Apache-2.0 terms.
+# Policy: only the licenses this crate itself uses (MIT OR Apache-2.0), plus the
+# Apache-2.0 WITH LLVM-exception variant that the Apache-licensed deps offer.
+# No proprietary licenses and no copyleft. cargo-deny denies anything not listed
+# here, so a dependency carrying any other license fails CI and forces a
+# conscious decision rather than silently entering the tree.
 allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "ISC",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "Unicode-3.0",
-    "Zlib",
 ]
 
 [bans]
