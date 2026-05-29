@@ -13,7 +13,9 @@ the output ANSI stream.
 
 - **PTY & process lifecycle** — spawns the target inside a master/slave PTY pair
   with a fixed geometry (120×40), `TERM=xterm-256color`, and inherited working
-  directory and environment. The master end is multiplexed asynchronously.
+  directory and environment. The master end is multiplexed by dedicated
+  reader/writer threads (no async runtime), so the caller's thread never blocks
+  on PTY I/O.
 - **Input jittering** — commands are decomposed into individual UTF-8 characters
   and written with pseudo-random inter-character delays (alphanumerics
   40–120 ms, punctuation/separators 150–300 ms), terminated with a carriage

@@ -16,7 +16,12 @@ name = "flat-cyborg"
 path = "src/main.rs"
 
 [dependencies]
-pty-process = { version = "0.5.3", features = ["async"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "process", "time", "sync"] }
+# Blocking PTY backend only — the `async` feature (which pulls in tokio) is
+# deliberately not enabled. I/O is multiplexed with dedicated std threads.
+pty-process = "0.5.3"
+# Already in the tree transitively via pty-process (same version), so this adds
+# no compile cost. Used for process-group signalling (SIGKILL the whole group,
+# not just the direct child) on session teardown.
+rustix = { version = "1.1", features = ["process"] }
 
 [dev-dependencies]
