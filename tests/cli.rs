@@ -158,7 +158,7 @@ fn profile_claude_sets_the_reply_marker() {
             "--",
             "sh",
             "-c",
-            "printf 'banner\\n\\xe2\\x97\\x8f hello\\nnoise\\n\\xe2\\x97\\x8f world\\n'",
+            "printf 'banner\\n● hello\\nnoise\\n● world\\n'",
         ])
         .stdin(Stdio::null())
         .output()
@@ -179,7 +179,7 @@ fn explicit_response_marker_overrides_profile() {
             "--",
             "sh",
             "-c",
-            "printf '\\xe2\\x97\\x8f circle\\n@@ at\\n'",
+            "printf '● circle\\n@@ at\\n'",
         ])
         .stdin(Stdio::null())
         .output()
