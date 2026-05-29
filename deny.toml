@@ -1,0 +1,33 @@
+[graph]
+# Exclude dev-dependencies from license/ban checks.
+exclude-dev = true
+
+[advisories]
+# Vulnerability scanning is handled by `cargo audit` in CI; cargo-deny
+# focuses on licenses, bans, and sources here.
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses compatible with this crate's MIT OR Apache-2.0 terms.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
