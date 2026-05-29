@@ -368,9 +368,10 @@ mod tests {
     #[test]
     fn erase_line_to_end_after_cursor_move() {
         let mut s = Screen::new(2, 12);
-        s.feed(b"a long line\r\x1b[5Cshort\x1b[K");
-        // Columns 0..4 keep "a lo", then "short" written, then erase-to-end.
-        assert_eq!(s.text(), "a loshort");
+        // Write 0-9, return, forward 5 columns, overwrite "XX", erase to end.
+        s.feed(b"0123456789\r\x1b[5CXX\x1b[K");
+        // Cols 0-4 keep "01234", cols 5-6 become "XX", cols 7-9 erased.
+        assert_eq!(s.text(), "01234XX");
     }
 
     #[test]
