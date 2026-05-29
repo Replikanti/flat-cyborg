@@ -19,6 +19,12 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod error;
+pub mod pty;
+
+pub use error::{Error, Result};
+pub use pty::PtySession;
+
 /// Crate version string, sourced from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
