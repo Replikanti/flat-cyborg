@@ -218,6 +218,13 @@ impl PtySession {
         }
     }
 
+    /// Returns a cloneable handle for writing input from another thread (e.g.
+    /// an interactive front-end forwarding the host's keystrokes), or `None`
+    /// if the session is already closing.
+    pub fn input_handle(&self) -> Option<InputHandle> {
+        self.input.as_ref().map(|tx| InputHandle(tx.clone()))
+    }
+
     /// The OS process id of the child.
     pub fn child_id(&self) -> u32 {
         self.child.id()
@@ -259,6 +266,27 @@ impl PtySession {
                 }
             }
         }
+    }
+}
+
+/// A cloneable, `Send` handle for writing input to a [`PtySession`]'s master
+/// from another thread. Writes are enqueued (non-blocking); the session's
+/// writer thread performs the actual write.
+#[derive(Clone)]
+pub struct InputHandle(Sender<Vec<u8>>);
+
+impl InputHandle {
+    /// Queues `bytes` to be written to the PTY master.
+    ///
+    /// # Errors
+    /// Returns an error if the session (and its writer thread) has shut down.
+    pub fn write(&self, bytes: &[u8]) -> Result<()> {
+        self.0.send(bytes.to_vec()).map_err(|_| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "pty writer thread terminated",
+            ))
+        })
     }
 }
 
