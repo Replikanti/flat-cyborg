@@ -354,6 +354,7 @@ struct Canvas {
     line: Vec<char>,
     col: usize,
     changed: bool,
+    committed_lines: usize,
 }
 
 impl Canvas {
@@ -384,6 +385,7 @@ impl Canvas {
         self.committed.push('\n');
         self.line.clear();
         self.col = 0;
+        self.committed_lines += 1;
         self.changed = true;
     }
 }
@@ -495,6 +497,15 @@ impl Sanitizer {
     /// The current (uncommitted) line verbatim.
     pub fn current_line(&self) -> String {
         self.canvas.line.iter().collect()
+    }
+
+    /// The number of lines committed (i.e. newline-terminated) so far.
+    ///
+    /// This advances by one per `\n` regardless of how the stream is chunked,
+    /// so it serves as a stable identity for "the line currently on screen":
+    /// the current prompt belongs to commit index `committed_lines()`.
+    pub fn committed_lines(&self) -> usize {
+        self.canvas.committed_lines
     }
 }
 
