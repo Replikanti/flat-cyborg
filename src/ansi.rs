@@ -35,13 +35,14 @@ const MAX_COL: usize = 1 << 16;
 const MAX_OSC: usize = 1 << 16;
 
 /// Sink for the structural events produced by [`Parser`].
-trait Perform {
+pub(crate) trait Perform {
     /// A printable character (already UTF-8 decoded).
     fn print(&mut self, c: char);
     /// A C0 control byte (`\n`, `\r`, `\t`, backspace, ...).
     fn execute(&mut self, byte: u8);
-    /// A completed CSI sequence: numeric parameters and the final byte.
-    fn csi(&mut self, params: &[u16], final_byte: u8);
+    /// A completed CSI sequence: numeric parameters, the private-marker byte
+    /// (e.g. `?` in `ESC[?1049h`) if present, and the final byte.
+    fn csi(&mut self, params: &[u16], private: Option<u8>, final_byte: u8);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,11 +68,12 @@ fn is_executable_c0(byte: u8) -> bool {
 /// recognizes CSI/OSC/other escape sequences, and reports structural events to
 /// a [`Perform`] sink.
 #[derive(Debug)]
-struct Parser {
+pub(crate) struct Parser {
     state: PState,
     params: Vec<u16>,
     cur: u32,
     saw_digit: bool,
+    private: Option<u8>,
     osc_len: usize,
     utf8_buf: [u8; 4],
     utf8_len: usize,
@@ -85,6 +87,7 @@ impl Default for Parser {
             params: Vec::new(),
             cur: 0,
             saw_digit: false,
+            private: None,
             osc_len: 0,
             utf8_buf: [0; 4],
             utf8_len: 0,
@@ -98,11 +101,12 @@ impl Parser {
         self.params.clear();
         self.cur = 0;
         self.saw_digit = false;
+        self.private = None;
     }
 
     /// Emits whatever has accumulated in the UTF-8 buffer, substituting the
     /// replacement character if the bytes do not form a valid code point.
-    fn flush_utf8<P: Perform>(&mut self, perform: &mut P) {
+    pub(crate) fn flush_utf8<P: Perform>(&mut self, perform: &mut P) {
         if self.utf8_len == 0 {
             return;
         }
@@ -119,7 +123,7 @@ impl Parser {
     }
 
     /// Advances the parser by a single byte.
-    fn advance<P: Perform>(&mut self, perform: &mut P, byte: u8) {
+    pub(crate) fn advance<P: Perform>(&mut self, perform: &mut P, byte: u8) {
         // Mid UTF-8 multi-byte sequence: only continuation bytes are valid.
         if self.utf8_need > 0 {
             if (0x80..=0xBF).contains(&byte) {
@@ -234,10 +238,13 @@ impl Parser {
                 self.cur = 0;
                 self.saw_digit = false;
             }
-            // Colon subparameter separators (ISO 8613-6 / colon-form SGR),
-            // private markers ('<' '=' '>' '?'), and intermediates: ignored so
-            // the sequence still terminates on its final byte.
-            0x3A | 0x3C..=0x3F | 0x20..=0x2F => {}
+            // Private markers ('<' '=' '>' '?'): remembered so handlers can
+            // distinguish e.g. DECSET `ESC[?1049h` from plain CSI.
+            0x3C..=0x3F => self.private = Some(byte),
+            // Colon subparameter separators (ISO 8613-6 / colon-form SGR) and
+            // intermediates: ignored so the sequence still terminates on its
+            // final byte.
+            0x3A | 0x20..=0x2F => {}
             // DEL is ignored within a CSI.
             0x7F => {}
             // Final byte completes the sequence.
@@ -246,7 +253,7 @@ impl Parser {
                     self.params.push(self.cur as u16);
                 }
                 let params = std::mem::take(&mut self.params);
-                perform.csi(&params, byte);
+                perform.csi(&params, self.private, byte);
                 self.params = params;
                 self.reset_params();
                 self.state = PState::Ground;
@@ -293,7 +300,7 @@ impl Perform for StripSink {
         // Preserve the raw control bytes; only escape sequences are removed.
         self.out.push(byte as char);
     }
-    fn csi(&mut self, _params: &[u16], _final_byte: u8) {}
+    fn csi(&mut self, _params: &[u16], _private: Option<u8>, _final_byte: u8) {}
 }
 
 /// Streaming remover of ANSI escape sequences.
@@ -408,7 +415,7 @@ impl Perform for Canvas {
         }
     }
 
-    fn csi(&mut self, params: &[u16], final_byte: u8) {
+    fn csi(&mut self, params: &[u16], _private: Option<u8>, final_byte: u8) {
         let first = params.first().copied().unwrap_or(0);
         match final_byte {
             // Cursor horizontal absolute (1-based), clamped.
