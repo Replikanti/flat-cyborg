@@ -2,8 +2,9 @@
 //!
 //! [`PtySession`] allocates a native pseudo-terminal (master/slave pair) with
 //! a fixed geometry, spawns the Target CLI as a child process attached to the
-//! slave end, and exposes the master end as asynchronous read/write halves so
-//! the wrapper can multiplex I/O concurrently.
+//! slave end, and multiplexes the master end's I/O without an async runtime: a
+//! dedicated reader thread drains the master into a channel, while the caller
+//! writes to the master directly.
 //!
 //! The child fully inherits the current working directory and environment of
 //! the host process; only `TERM` is forced to `xterm-256color` so the target
@@ -11,9 +12,15 @@
 
 use crate::error::Result;
 use std::ffi::OsStr;
+use std::io::{Read, Write};
+use std::process::Child;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
-use pty_process::{OwnedReadPty, OwnedWritePty, Size};
-use tokio::process::Child;
+use pty_process::blocking::Pty;
+use pty_process::Size;
 
 /// Recommended terminal width, in character columns.
 pub const DEFAULT_COLS: u16 = 120;
@@ -22,15 +29,36 @@ pub const DEFAULT_ROWS: u16 = 40;
 /// Terminal type advertised to the Target CLI.
 pub const TERM: &str = "xterm-256color";
 
+/// Size of the reader thread's read buffer, in bytes.
+const READ_CHUNK: usize = 8192;
+
+/// The result of polling the PTY for output.
+#[derive(Debug)]
+pub enum Output {
+    /// A chunk of raw bytes read from the master.
+    Data(Vec<u8>),
+    /// No new output arrived within the poll timeout (the target may be
+    /// running silently or waiting at a prompt).
+    Idle,
+    /// The master reached end-of-stream: the child closed the slave (it has
+    /// exited or is about to).
+    Eof,
+}
+
 /// An interactive Target CLI running inside a pseudo-terminal.
 ///
-/// The master end is split into independently-movable read and write halves
-/// so a reader task and a writer task can operate on the PTY concurrently
-/// without contending on a single handle.
+/// I/O is multiplexed with std threads rather than an async runtime. A reader
+/// thread continuously reads the PTY master and forwards chunks over a channel;
+/// the caller writes input to the master directly via [`PtySession::write_input`]
+/// and polls output via [`PtySession::read_output`].
 pub struct PtySession {
-    reader: OwnedReadPty,
-    writer: OwnedWritePty,
+    /// The master end, shared between the writer (this handle) and the reader
+    /// thread. The PTY is full-duplex, so concurrent read/write on the shared
+    /// file descriptor is safe.
+    pty: Arc<Pty>,
     child: Child,
+    output: Receiver<Vec<u8>>,
+    reader: Option<JoinHandle<()>>,
 }
 
 impl PtySession {
@@ -63,97 +91,133 @@ impl PtySession {
         I: IntoIterator<Item = A>,
         A: AsRef<OsStr>,
     {
-        let (pty, pts) = pty_process::open()?;
+        let (pty, pts) = pty_process::blocking::open()?;
         pty.resize(Size::new(rows, cols))?;
 
-        // `pty_process::Command` wraps `tokio::process::Command`, which inherits
-        // the parent CWD and environment by default. We only override `TERM`.
-        let child = pty_process::Command::new(program)
+        // `pty_process::blocking::Command` wraps `std::process::Command`, which
+        // inherits the parent CWD and environment by default. We only set TERM.
+        let child = pty_process::blocking::Command::new(program)
             .args(args)
             .env("TERM", TERM)
             .spawn(pts)?;
 
-        let (reader, writer) = pty.into_split();
+        let pty = Arc::new(pty);
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+        let reader_pty = Arc::clone(&pty);
+        let reader = std::thread::spawn(move || {
+            // `Read` is implemented for `&Pty`, so the shared handle is read
+            // without any interior mutability.
+            let mut handle: &Pty = &reader_pty;
+            let mut buf = [0u8; READ_CHUNK];
+            loop {
+                match handle.read(&mut buf) {
+                    Ok(0) => break, // clean EOF
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break; // receiver dropped
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // On Linux, reading the master after the slave closes
+                    // surfaces as EIO rather than a clean EOF. Treat any other
+                    // error as end-of-stream.
+                    Err(_) => break,
+                }
+            }
+        });
+
         Ok(Self {
-            reader,
-            writer,
+            pty,
             child,
+            output: rx,
+            reader: Some(reader),
         })
     }
 
-    /// Mutable access to the read half of the PTY master.
-    pub fn reader(&mut self) -> &mut OwnedReadPty {
-        &mut self.reader
+    /// Writes raw bytes to the PTY master (the child's stdin) and flushes.
+    ///
+    /// # Errors
+    /// Returns an error if the write or flush fails.
+    pub fn write_input(&self, bytes: &[u8]) -> Result<()> {
+        let mut handle: &Pty = &self.pty;
+        handle.write_all(bytes)?;
+        handle.flush()?;
+        Ok(())
     }
 
-    /// Mutable access to the write half of the PTY master.
-    pub fn writer(&mut self) -> &mut OwnedWritePty {
-        &mut self.writer
+    /// Waits up to `timeout` for the next chunk of output from the master.
+    ///
+    /// Returns [`Output::Data`] if bytes arrived, [`Output::Idle`] if the
+    /// timeout elapsed with no output, or [`Output::Eof`] once the child has
+    /// closed the slave end.
+    pub fn read_output(&self, timeout: Duration) -> Output {
+        match self.output.recv_timeout(timeout) {
+            Ok(chunk) => Output::Data(chunk),
+            Err(RecvTimeoutError::Timeout) => Output::Idle,
+            Err(RecvTimeoutError::Disconnected) => Output::Eof,
+        }
     }
 
-    /// The child process handle.
-    pub fn child(&mut self) -> &mut Child {
-        &mut self.child
-    }
-
-    /// The OS process id of the child, or `None` if it has already exited and
-    /// been reaped.
-    pub fn child_id(&self) -> Option<u32> {
+    /// The OS process id of the child.
+    pub fn child_id(&self) -> u32 {
         self.child.id()
     }
 
-    /// Consumes the session, returning its component handles so a caller can
-    /// move the read half, write half, and child into independent tasks.
-    pub fn into_parts(self) -> (OwnedReadPty, OwnedWritePty, Child) {
-        (self.reader, self.writer, self.child)
+    /// Mutable access to the child process handle (for signalling / waiting).
+    pub fn child(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        // Guarantee the child does not outlive the session. Killing it closes
+        // the slave, which unblocks the reader thread (EIO/EOF) so it can be
+        // joined without hanging.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::time::{timeout, Duration};
+    use std::time::Instant;
 
-    /// Reads from the PTY master until `needle` is seen or the stream ends.
-    ///
-    /// On Linux, reading the master after the slave closes surfaces as an
-    /// `EIO` error rather than a clean EOF; both are treated as end-of-stream.
-    async fn read_until(reader: &mut OwnedReadPty, needle: &str) -> String {
+    /// Drains output until `needle` is seen or `deadline` passes.
+    fn read_until(session: &PtySession, needle: &str, deadline: Duration) -> String {
+        let start = Instant::now();
         let mut acc = String::new();
-        let mut buf = [0u8; 1024];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+        while start.elapsed() < deadline {
+            match session.read_output(Duration::from_millis(200)) {
+                Output::Data(chunk) => {
+                    acc.push_str(&String::from_utf8_lossy(&chunk));
                     if acc.contains(needle) {
                         break;
                     }
                 }
-                Err(_) => break,
+                Output::Idle => continue,
+                Output::Eof => break,
             }
         }
         acc
     }
 
-    #[tokio::test]
-    async fn target_detects_a_tty() {
+    #[test]
+    fn target_detects_a_tty() {
         // The Target CLI sees a real terminal on its stdout, so `[ -t 1 ]`
         // succeeds and it launches in "interactive" mode rather than headless.
-        let mut session = PtySession::spawn(
+        let session = PtySession::spawn(
             "sh",
             ["-c", "if [ -t 1 ]; then echo HAS_TTY; else echo NO_TTY; fi"],
         )
         .expect("spawn target in pty");
 
-        let out = timeout(
-            Duration::from_secs(5),
-            read_until(session.reader(), "HAS_TTY"),
-        )
-        .await
-        .expect("read did not time out");
-
+        let out = read_until(&session, "HAS_TTY", Duration::from_secs(5));
         assert!(
             out.contains("HAS_TTY"),
             "target did not detect a tty: {out:?}"
@@ -161,30 +225,39 @@ mod tests {
         assert!(!out.contains("NO_TTY"));
     }
 
-    #[tokio::test]
-    async fn spawn_reports_child_id() {
+    #[test]
+    fn spawn_reports_child_id() {
         let session = PtySession::spawn("sh", ["-c", "sleep 1"]).expect("spawn");
-        assert!(session.child_id().is_some());
+        assert!(session.child_id() > 0);
     }
 
-    #[tokio::test]
-    async fn input_written_to_master_reaches_target() {
-        // `cat` echoes its stdin back; prove the write half drives the child.
-        let mut session = PtySession::spawn("cat", std::iter::empty::<&str>()).expect("spawn cat");
-        session
-            .writer()
-            .write_all(b"ping\r")
-            .await
-            .expect("write to master");
-        let out = timeout(Duration::from_secs(5), read_until(session.reader(), "ping"))
-            .await
-            .expect("read did not time out");
+    #[test]
+    fn input_written_to_master_reaches_target() {
+        // `cat` echoes its stdin back; prove the write path drives the child.
+        let session = PtySession::spawn("cat", std::iter::empty::<&str>()).expect("spawn cat");
+        session.write_input(b"ping\r").expect("write to master");
+        let out = read_until(&session, "ping", Duration::from_secs(5));
         assert!(
             out.contains("ping"),
             "did not observe echoed input: {out:?}"
         );
+        // `session` is dropped here, which kills `cat` and joins the reader.
+    }
 
-        // Close the child so the test process does not linger.
-        let _ = session.child().start_kill();
+    #[test]
+    fn reports_eof_after_child_exits() {
+        let session = PtySession::spawn("sh", ["-c", "echo bye"]).expect("spawn");
+        let mut saw_eof = false;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            match session.read_output(Duration::from_millis(200)) {
+                Output::Eof => {
+                    saw_eof = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw_eof, "expected EOF after the child exited");
     }
 }
