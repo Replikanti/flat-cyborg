@@ -16,10 +16,23 @@
 //!   that overwrite-based progress spinners collapse to their final frame and
 //!   leave no artifacts in the sanitized log.
 //!
+//! The parser is 7-bit oriented (the wrapper forces `TERM=xterm-256color`, so
+//! escape sequences arrive in their 7-bit `ESC ...` form). State — including
+//! partial sequences and partial UTF-8 code points — is retained across calls,
+//! so the stream may be fed in arbitrary chunks.
+//!
 //! State detection helpers ([`is_confirmation_prompt`], [`line_ends_with_any`])
 //! operate on the sanitized stream. The temporal half of state detection
 //! (RUNNING vs. IDLE, which depends on a period of silence) lives in the
 //! wrapper, since it requires a clock.
+
+/// Upper bound on the addressable column, bounding the per-line allocation so a
+/// malicious cursor-forward sequence (`ESC[<huge>C`) cannot exhaust memory.
+const MAX_COL: usize = 1 << 16;
+
+/// Upper bound on an OSC/string payload before it is treated as runaway and
+/// aborted, so an unterminated OSC cannot swallow the entire stream.
+const MAX_OSC: usize = 1 << 16;
 
 /// Sink for the structural events produced by [`Parser`].
 trait Perform {
@@ -41,19 +54,25 @@ enum PState {
     OscStringEsc,
 }
 
+/// Returns `true` for the C0 control bytes that are executed immediately even
+/// in the middle of an escape sequence (per ECMA-48). `CAN`/`SUB` (which abort)
+/// and `ESC` (which restarts) are handled separately.
+fn is_executable_c0(byte: u8) -> bool {
+    matches!(byte, 0x00..=0x17 | 0x19 | 0x1C..=0x1F)
+}
+
 /// A compact, allocation-light ANSI/VT byte parser.
 ///
 /// Feed it bytes one at a time via [`Parser::advance`]; it decodes UTF-8,
 /// recognizes CSI/OSC/other escape sequences, and reports structural events to
-/// a [`Perform`] sink. Parsing state (including partial sequences and partial
-/// UTF-8 code points) is retained across calls, so it is safe to feed the
-/// stream in arbitrary chunks.
+/// a [`Perform`] sink.
 #[derive(Debug)]
 struct Parser {
     state: PState,
     params: Vec<u16>,
     cur: u32,
     saw_digit: bool,
+    osc_len: usize,
     utf8_buf: [u8; 4],
     utf8_len: usize,
     utf8_need: usize,
@@ -66,6 +85,7 @@ impl Default for Parser {
             params: Vec::new(),
             cur: 0,
             saw_digit: false,
+            osc_len: 0,
             utf8_buf: [0; 4],
             utf8_len: 0,
             utf8_need: 0,
@@ -116,27 +136,41 @@ impl Parser {
             self.utf8_need = 0;
         }
 
+        // ESC starts (or restarts) an escape sequence from any state. Inside an
+        // OSC string it may instead be the ST introducer.
+        if byte == 0x1B {
+            if matches!(self.state, PState::OscString) {
+                self.state = PState::OscStringEsc;
+            } else {
+                self.reset_params();
+                self.state = PState::Esc;
+            }
+            return;
+        }
+
         match self.state {
             PState::Ground => self.ground(perform, byte),
-            PState::Esc => self.escape(byte),
-            PState::EscIntermediate => self.state = PState::Ground,
+            PState::Esc => self.escape(perform, byte),
+            PState::EscIntermediate => self.esc_intermediate(perform, byte),
             PState::Csi => self.csi(perform, byte),
-            PState::OscString => match byte {
-                0x07 => self.state = PState::Ground, // BEL terminates OSC
-                0x1B => self.state = PState::OscStringEsc,
-                _ => {}
-            },
+            PState::OscString => self.osc(perform, byte),
             PState::OscStringEsc => {
-                // ESC `\` is the String Terminator; any other byte aborts.
-                self.state = PState::Ground;
+                if byte == b'\\' {
+                    self.state = PState::Ground; // ST terminator (ESC \)
+                } else {
+                    // The ESC began a fresh escape sequence, not an ST.
+                    self.reset_params();
+                    self.state = PState::Esc;
+                    self.escape(perform, byte);
+                }
             }
         }
     }
 
     fn ground<P: Perform>(&mut self, perform: &mut P, byte: u8) {
         match byte {
-            0x1B => self.state = PState::Esc,
-            // C0 controls and DEL are executed, not printed.
+            // C0 controls and DEL are executed, not printed. (ESC handled in
+            // `advance`.)
             b if b < 0x20 || b == 0x7F => perform.execute(b),
             b if b < 0x80 => perform.print(b as char),
             // UTF-8 lead byte: determine how many continuation bytes follow.
@@ -158,13 +192,17 @@ impl Parser {
         }
     }
 
-    fn escape(&mut self, byte: u8) {
-        self.reset_params();
+    fn escape<P: Perform>(&mut self, perform: &mut P, byte: u8) {
         match byte {
+            b if is_executable_c0(b) => perform.execute(b), // stay in Esc
+            0x18 | 0x1A => self.state = PState::Ground,     // CAN/SUB abort
             b'[' => self.state = PState::Csi,
             // OSC and the other string-style sequences (DCS/SOS/PM/APC) all
             // run until BEL or ST; treat them uniformly.
-            b']' | b'P' | b'X' | b'^' | b'_' => self.state = PState::OscString,
+            b']' | b'P' | b'X' | b'^' | b'_' => {
+                self.osc_len = 0;
+                self.state = PState::OscString;
+            }
             // Intermediate byte (e.g. charset designators `ESC ( B`): one more
             // byte follows before the sequence completes.
             0x20..=0x2F => self.state = PState::EscIntermediate,
@@ -173,8 +211,20 @@ impl Parser {
         }
     }
 
+    fn esc_intermediate<P: Perform>(&mut self, perform: &mut P, byte: u8) {
+        match byte {
+            b if is_executable_c0(b) => perform.execute(b), // stay
+            _ => self.state = PState::Ground,
+        }
+    }
+
     fn csi<P: Perform>(&mut self, perform: &mut P, byte: u8) {
         match byte {
+            b if is_executable_c0(b) => perform.execute(b), // execute, stay in CSI
+            0x18 | 0x1A => {
+                self.reset_params();
+                self.state = PState::Ground; // CAN/SUB abort
+            }
             0x30..=0x39 => {
                 self.cur = (self.cur * 10 + u32::from(byte - b'0')).min(u32::from(u16::MAX));
                 self.saw_digit = true;
@@ -184,8 +234,12 @@ impl Parser {
                 self.cur = 0;
                 self.saw_digit = false;
             }
-            // Private markers ('<' '=' '>' '?') and intermediates: ignored.
-            0x3C..=0x3F | 0x20..=0x2F => {}
+            // Colon subparameter separators (ISO 8613-6 / colon-form SGR),
+            // private markers ('<' '=' '>' '?'), and intermediates: ignored so
+            // the sequence still terminates on its final byte.
+            0x3A | 0x3C..=0x3F | 0x20..=0x2F => {}
+            // DEL is ignored within a CSI.
+            0x7F => {}
             // Final byte completes the sequence.
             0x40..=0x7E => {
                 if self.saw_digit {
@@ -201,6 +255,23 @@ impl Parser {
                 self.reset_params();
                 self.state = PState::Ground;
             }
+        }
+    }
+
+    fn osc<P: Perform>(&mut self, perform: &mut P, byte: u8) {
+        // (ESC and BEL are handled before reaching here / below.)
+        self.osc_len += 1;
+        match byte {
+            0x07 => self.state = PState::Ground, // BEL terminates OSC
+            // A newline almost certainly means the OSC was truncated or
+            // malformed; abort and execute the control rather than swallow the
+            // rest of the stream.
+            b'\n' | b'\r' => {
+                self.state = PState::Ground;
+                perform.execute(byte);
+            }
+            _ if self.osc_len > MAX_OSC => self.state = PState::Ground, // runaway guard
+            _ => {}
         }
     }
 }
@@ -251,6 +322,15 @@ impl AnsiStripper {
         }
         sink.out
     }
+
+    /// Flushes any dangling partial UTF-8 code point at the true end of the
+    /// stream, emitting the replacement character for it. Returns the text (if
+    /// any) produced.
+    pub fn finish(&mut self) -> String {
+        let mut sink = StripSink::default();
+        self.parser.flush_utf8(&mut sink);
+        sink.out
+    }
 }
 
 /// Removes ANSI escape sequences from `input` in a single call.
@@ -258,7 +338,10 @@ impl AnsiStripper {
 /// Equivalent in intent to the spec's `\x1B\[[0-9;]*[a-zA-Z]` strip, but also
 /// strips OSC and other escape forms. All non-escape bytes are preserved.
 pub fn strip_ansi(input: &str) -> String {
-    AnsiStripper::new().feed(input.as_bytes())
+    let mut stripper = AnsiStripper::new();
+    let mut out = stripper.feed(input.as_bytes());
+    out.push_str(&stripper.finish());
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -311,20 +394,14 @@ impl Perform for Canvas {
     }
 
     fn execute(&mut self, byte: u8) {
+        // Pure cursor movements (CR, BS, HT) do not mark the canvas changed —
+        // only visible content changes (writes, commits, erases) do, so the
+        // wrapper's RUNNING detection is not fooled by cursor churn.
         match byte {
             b'\n' => self.commit_line(),
-            b'\r' => {
-                self.col = 0;
-                self.changed = true;
-            }
-            0x08 => {
-                self.col = self.col.saturating_sub(1);
-                self.changed = true;
-            }
-            b'\t' => {
-                self.col = (self.col / 8 + 1) * 8;
-                self.changed = true;
-            }
+            b'\r' => self.col = 0,
+            0x08 => self.col = self.col.saturating_sub(1),
+            b'\t' => self.col = ((self.col / 8 + 1) * 8).min(MAX_COL),
             _ => {}
         }
     }
@@ -332,18 +409,20 @@ impl Perform for Canvas {
     fn csi(&mut self, params: &[u16], final_byte: u8) {
         let first = params.first().copied().unwrap_or(0);
         match final_byte {
-            // Cursor horizontal absolute (1-based).
-            b'G' => self.col = first.max(1) as usize - 1,
-            // Cursor forward / back.
-            b'C' => self.col += first.max(1) as usize,
+            // Cursor horizontal absolute (1-based), clamped.
+            b'G' => self.col = (first.max(1) as usize - 1).min(MAX_COL),
+            // Cursor forward / back, clamped.
+            b'C' => self.col = (self.col + first.max(1) as usize).min(MAX_COL),
             b'D' => self.col = self.col.saturating_sub(first.max(1) as usize),
-            // Erase in line: 0 = to end, 1 = to start, 2 = whole line.
+            // Erase in line: 0 = to end, 1 = to start (inclusive of cursor),
+            // 2 = whole line.
             b'K' => {
                 match first {
                     0 => self.line.truncate(self.col),
                     1 => {
                         self.pad_to_col();
-                        for cell in self.line.iter_mut().take(self.col) {
+                        let end = (self.col + 1).min(self.line.len());
+                        for cell in self.line.iter_mut().take(end) {
                             *cell = ' ';
                         }
                     }
@@ -389,13 +468,19 @@ impl Sanitizer {
     /// Feeds a chunk of raw bytes from the PTY master.
     ///
     /// Returns `true` if the visible canvas changed as a result (used by the
-    /// wrapper to distinguish the RUNNING state from silence).
+    /// wrapper to distinguish the RUNNING state from silence). Pure cursor
+    /// movements do not count as a change.
     pub fn feed(&mut self, input: &[u8]) -> bool {
         self.canvas.changed = false;
         for &b in input {
             self.parser.advance(&mut self.canvas, b);
         }
         self.canvas.changed
+    }
+
+    /// Flushes any dangling partial UTF-8 at the true end of the stream.
+    pub fn finish(&mut self) {
+        self.parser.flush_utf8(&mut self.canvas);
     }
 
     /// The full sanitized log: all committed lines plus the current,
@@ -417,32 +502,66 @@ impl Sanitizer {
 // Detection primitives.
 // ---------------------------------------------------------------------------
 
-/// Confirmation-prompt shapes recognized in sanitized output, lowercased.
-const CONFIRMATION_PATTERNS: &[&str] =
-    &["[y/n]", "(y/n)", "[yes/no]", "(yes/no)", "y/n?", "yes/no?"];
+/// Returns the last non-empty line of `text`, or `""` if there is none.
+fn last_non_empty_line(text: &str) -> &str {
+    text.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+}
 
-/// Returns `true` if `text` contains a yes/no confirmation prompt such as
-/// `[y/n]`, `(Y/n)`, or `[yes/no]` (case-insensitive).
+/// Returns `true` if the last non-empty line of `text` looks like a yes/no
+/// confirmation prompt: a bracketed or parenthesized group whose options
+/// (split on `/` or `,`) include both a "yes" and a "no" choice — e.g.
+/// `[y/n]`, `(Y/n)`, `[yes/no]`, `[y/N/a]`, `[y,N,a,q,?]`. A bare `y/n` or
+/// `yes/no` (no brackets) is also accepted.
+///
+/// Only the last line is inspected, so an already-answered prompt scrolled up
+/// in the buffer does not trigger a match.
 pub fn is_confirmation_prompt(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    CONFIRMATION_PATTERNS.iter().any(|p| lower.contains(p))
+    let line = last_non_empty_line(text).to_ascii_lowercase();
+
+    for (open, close) in [('[', ']'), ('(', ')')] {
+        let mut rest = line.as_str();
+        while let Some(o) = rest.find(open) {
+            let after = &rest[o + 1..];
+            let Some(c) = after.find(close) else { break };
+            let group = &after[..c];
+            if group_is_yes_no(group) {
+                return true;
+            }
+            rest = &after[c + 1..];
+        }
+    }
+
+    // Bracket-less forms.
+    line.contains("y/n") || line.contains("yes/no")
+}
+
+/// Whether a bracket group's options include both a yes and a no choice.
+fn group_is_yes_no(group: &str) -> bool {
+    let mut has_yes = false;
+    let mut has_no = false;
+    for opt in group.split(['/', ',']) {
+        match opt.trim() {
+            "y" | "yes" => has_yes = true,
+            "n" | "no" => has_no = true,
+            _ => {}
+        }
+    }
+    has_yes && has_no
 }
 
 /// Returns `true` if the last non-empty line of `text` ends with any of the
-/// given prompt tokens, comparing both sides with trailing whitespace removed.
+/// given prompt tokens, matched verbatim.
 ///
-/// Used to recognize a Target CLI's trailing prompt (e.g. `> `, `$ `). Trailing
-/// whitespace is normalized away on both the line and the token so that a
-/// prompt token like `"> "` still matches a line rendered as `">"`.
+/// Used to recognize a Target CLI's trailing prompt. Tokens are matched exactly
+/// (including any trailing space), so callers should pass distinctive tokens
+/// such as `"> "` or `"$ "` rather than a bare `">"`, which would also match
+/// ordinary text like `Vec<T>`.
 pub fn line_ends_with_any(text: &str, tokens: &[&str]) -> bool {
-    let Some(line) = text.lines().rev().find(|l| !l.trim().is_empty()) else {
-        return false;
-    };
-    let line = line.trim_end();
-    tokens.iter().any(|t| {
-        let token = t.trim_end();
-        !token.is_empty() && line.ends_with(token)
-    })
+    let line = last_non_empty_line(text);
+    tokens.iter().any(|t| !t.is_empty() && line.ends_with(t))
 }
 
 #[cfg(test)]
@@ -456,6 +575,13 @@ mod tests {
     }
 
     #[test]
+    fn strips_colon_form_sgr() {
+        // ISO 8613-6 colon-form truecolor SGR must be fully consumed, not
+        // leaked as `2:255:0:0m...` into the clean text.
+        assert_eq!(strip_ansi("\x1b[38:2:255:0:0mX\x1b[0m"), "X");
+    }
+
+    #[test]
     fn strips_cursor_and_erase_sequences() {
         let input = "loading\x1b[2K\x1b[1Gdone\x1b[K";
         assert_eq!(strip_ansi(input), "loadingdone");
@@ -463,12 +589,31 @@ mod tests {
 
     #[test]
     fn strips_osc_title_sequence() {
-        // OSC 0 ; title BEL  — set window title.
         let input = "\x1b]0;my title\x07hello";
         assert_eq!(strip_ansi(input), "hello");
-        // OSC terminated by ST (ESC \) instead of BEL.
         let st = "\x1b]0;title\x1b\\world";
         assert_eq!(strip_ansi(st), "world");
+    }
+
+    #[test]
+    fn unterminated_osc_does_not_swallow_the_stream() {
+        // A truncated OSC (no BEL/ST) followed by a newline must abort, not
+        // eat everything that follows.
+        let input = "\x1b]0;title-without-terminator\nreal output\n";
+        assert_eq!(strip_ansi(input), "\nreal output\n");
+    }
+
+    #[test]
+    fn c0_control_inside_csi_is_not_lost() {
+        // A newline arriving mid-CSI is executed (preserved), and the CSI still
+        // terminates on its final byte.
+        assert_eq!(strip_ansi("a\x1b[3\n1mb"), "a\nb");
+    }
+
+    #[test]
+    fn esc_restarts_sequence_from_within_csi() {
+        // An ESC mid-CSI begins a new escape; nothing leaks.
+        assert_eq!(strip_ansi("x\x1b[3\x1b[31my"), "xy");
     }
 
     #[test]
@@ -478,9 +623,17 @@ mod tests {
     }
 
     #[test]
+    fn dangling_utf8_flushed_on_finish() {
+        let mut s = AnsiStripper::new();
+        // Lead byte of a 2-byte sequence with no continuation before EOS.
+        let out = s.feed(&[0xC3]);
+        assert_eq!(out, "");
+        assert_eq!(s.finish(), "\u{FFFD}");
+    }
+
+    #[test]
     fn handles_escape_split_across_chunks() {
         let mut s = AnsiStripper::new();
-        // The CSI sequence is split mid-way between two feeds.
         let mut out = s.feed(b"foo\x1b[3");
         out.push_str(&s.feed(b"1mbar"));
         assert_eq!(out, "foobar");
@@ -489,46 +642,57 @@ mod tests {
     #[test]
     fn sanitizer_collapses_carriage_return_spinner() {
         let mut s = Sanitizer::new();
-        // A real spinner returns to column 0 with `\r`, rewrites the frame, and
-        // erases any leftover from a longer previous frame with `\x1b[K`.
         s.feed(b"\r\x1b[36m|\x1b[0m working...\x1b[K");
         s.feed(b"\r\x1b[36m/\x1b[0m working...\x1b[K");
         s.feed(b"\r\x1b[36m-\x1b[0m working...\x1b[K");
         s.feed(b"\rdone!\x1b[K\n");
-        // Only the final committed line survives; no spinner frames remain and
-        // the wider previous frames leave no trailing artifacts.
         assert_eq!(s.clean_log(), "done!\n");
     }
 
     #[test]
     fn sanitizer_applies_erase_line_after_carriage_return() {
         let mut s = Sanitizer::new();
-        // Longer frame, then a shorter frame after \r + erase-to-end.
         s.feed(b"a long status line\r");
         s.feed(b"short\x1b[K\n");
         assert_eq!(s.clean_log(), "short\n");
     }
 
     #[test]
+    fn sanitizer_erase_to_start_is_inclusive_of_cursor() {
+        let mut s = Sanitizer::new();
+        // Cursor at col 2 (on 'c'); ESC[1K erases columns 0..=2 inclusive.
+        s.feed(b"abcde\r\x1b[2C\x1b[1K");
+        assert_eq!(s.current_line(), "   de");
+    }
+
+    #[test]
     fn sanitizer_handles_backspace() {
         let mut s = Sanitizer::new();
-        // Backspace moves the cursor left (it does not delete); the next write
-        // overwrites in place, as a real terminal would render it.
         s.feed(b"abc\x08X");
         assert_eq!(s.current_line(), "abX");
 
-        // The common erase idiom `\b \b` blanks the last character, leaving a
-        // space in that cell (the cursor ends to its left).
         let mut s2 = Sanitizer::new();
         s2.feed(b"abc\x08 \x08");
         assert_eq!(s2.current_line(), "ab ");
     }
 
     #[test]
-    fn sanitizer_tracks_change_flag() {
+    fn sanitizer_change_flag_ignores_pure_cursor_moves() {
         let mut s = Sanitizer::new();
         assert!(s.feed(b"output"));
-        assert!(!s.feed(b""));
+        assert!(!s.feed(b"")); // nothing
+        assert!(!s.feed(b"\r")); // pure cursor move — not a content change
+        assert!(!s.feed(b"\x08")); // backspace — cursor only
+        assert!(s.feed(b"x")); // a real write
+    }
+
+    #[test]
+    fn sanitizer_clamps_runaway_cursor_forward() {
+        let mut s = Sanitizer::new();
+        // A huge cursor-forward must not allocate gigabytes; the column is
+        // clamped and a following write stays bounded.
+        s.feed(b"\x1b[2000000000CX\n");
+        assert!(s.clean_log().len() <= MAX_COL + 2);
     }
 
     #[test]
@@ -537,16 +701,29 @@ mod tests {
         assert!(is_confirmation_prompt("Overwrite file? (Y/n)"));
         assert!(is_confirmation_prompt("Delete all? (y/N) "));
         assert!(is_confirmation_prompt("Continue [yes/no]"));
+        assert!(is_confirmation_prompt("Apply patch [y/N/a]?"));
+        assert!(is_confirmation_prompt("Stage this hunk [y,n,q,a,d,e,?]?"));
+        assert!(is_confirmation_prompt("really? y/n"));
         assert!(!is_confirmation_prompt("just some output"));
         assert!(!is_confirmation_prompt("the year was 1999"));
+        assert!(!is_confirmation_prompt("pick a range [2/3]"));
     }
 
     #[test]
-    fn detects_trailing_prompt() {
+    fn confirmation_only_matches_last_line() {
+        // An already-answered prompt scrolled up must not trigger.
+        let scrollback = "Proceed? [y/n]\ny\nDone.";
+        assert!(!is_confirmation_prompt(scrollback));
+    }
+
+    #[test]
+    fn detects_trailing_prompt_verbatim() {
         assert!(line_ends_with_any("welcome\n> ", &["> ", "$ "]));
-        assert!(line_ends_with_any("user@host:~$  ", &["$"]));
+        assert!(line_ends_with_any("user@host:~$ ", &["$ "]));
         assert!(!line_ends_with_any("still running...", &["> ", "$ "]));
         assert!(!line_ends_with_any("", &["> "]));
+        // Verbatim matching avoids over-matching ordinary text.
+        assert!(!line_ends_with_any("let v: Vec<T>", &["> "]));
     }
 
     #[test]
