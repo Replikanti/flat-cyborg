@@ -44,6 +44,9 @@ const READ_CHUNK: usize = 8192;
 const READER_JOIN_BUDGET: Duration = Duration::from_secs(2);
 /// Upper bound on how long [`Drop`] waits for the writer thread.
 const WRITER_JOIN_BUDGET: Duration = Duration::from_secs(1);
+/// Upper bound on reaping the child after SIGKILL, so a wedged (D-state) child
+/// cannot hang teardown indefinitely.
+const TERMINATE_REAP_BUDGET: Duration = Duration::from_secs(2);
 
 /// The result of polling the PTY for output.
 #[derive(Debug)]
@@ -240,7 +243,22 @@ impl PtySession {
         // (`child.id()` is only valid before `wait`.)
         kill_process_group(self.child.id());
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Reap, but bounded: a child wedged in uninterruptible (D) state will
+        // not die even on SIGKILL until its I/O completes, and a blind
+        // `wait()` would hang teardown. Poll `try_wait` and give up after a
+        // short budget — there is nothing more we can do for a D-state child.
+        let deadline = Instant::now() + TERMINATE_REAP_BUDGET;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
     }
 }
 

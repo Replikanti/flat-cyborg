@@ -61,6 +61,17 @@ impl Default for WrapperConfig {
     }
 }
 
+/// The Target CLI's lifecycle state, as classified from the sanitized stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    /// Output is actively appending.
+    Running,
+    /// A `[y/n]`-style prompt awaiting user interaction.
+    ConfirmationPrompt,
+    /// The trailing prompt is present and output has gone silent.
+    Idle,
+}
+
 /// How an operation finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -79,6 +90,7 @@ pub struct Wrapper {
     sanitizer: Sanitizer,
     jitter: Jitter,
     config: WrapperConfig,
+    state: State,
 }
 
 impl Wrapper {
@@ -94,12 +106,18 @@ impl Wrapper {
             sanitizer: Sanitizer::new(),
             jitter: Jitter::new(),
             config,
+            state: State::Running,
         }
     }
 
     /// Replaces the input jitter (e.g. with a zero-delay one in tests).
     pub fn set_jitter(&mut self, jitter: Jitter) {
         self.jitter = jitter;
+    }
+
+    /// The most recently classified lifecycle [`State`] of the target.
+    pub fn state(&self) -> State {
+        self.state
     }
 
     /// The sanitized output log accumulated so far (ANSI-stripped, spinner-free).
@@ -145,9 +163,12 @@ impl Wrapper {
         let start = Instant::now();
         let mut last_activity = Instant::now();
         let mut interrupted_at: Option<Instant> = None;
-        // The last confirmation-prompt line we answered, so we do not spam `y`
-        // while the same prompt is still on screen.
-        let mut answered: Option<String> = None;
+        // Whether the confirmation prompt currently on screen has already been
+        // answered. Re-armed once the current line stops looking like a prompt,
+        // so a *new* confirmation (even one with identical text) is answered
+        // again, while the echoed reply does not trigger a second answer.
+        let mut answered = false;
+        self.state = State::Running;
 
         loop {
             // Watchdog escalation.
@@ -169,24 +190,35 @@ impl Wrapper {
                 Output::Data(chunk) => {
                     if self.sanitizer.feed(&chunk) {
                         last_activity = Instant::now();
+                        self.state = State::Running;
                     }
-                    if self.config.auto_confirm && interrupted_at.is_none() {
-                        let line = self.sanitizer.current_line();
-                        if is_confirmation_prompt(&line)
-                            && answered.as_deref() != Some(line.as_str())
-                        {
-                            // Reply `y\r` through the jitter layer.
+                    let line = self.sanitizer.current_line();
+                    if is_confirmation_prompt(&line) {
+                        self.state = State::ConfirmationPrompt;
+                        if self.config.auto_confirm && interrupted_at.is_none() && !answered {
+                            // Reply `y\r` through the jitter layer (per spec).
                             let session = &self.session;
                             self.jitter
                                 .type_command("y", |bytes| session.write_input(bytes))?;
-                            answered = Some(line);
+                            answered = true;
                             last_activity = Instant::now();
+                            // The jittered reply may have slept; re-check the
+                            // deadline so it cannot push the first escalation
+                            // past `exec_timeout`.
+                            if start.elapsed() >= self.config.exec_timeout {
+                                let _ = self.session.write_input(&[0x03]);
+                                interrupted_at = Some(Instant::now());
+                            }
                         }
+                    } else {
+                        // No longer at a confirmation prompt: re-arm.
+                        answered = false;
                     }
                 }
                 Output::Idle => {
-                    // Silence: IDLE iff the trailing prompt is present and we
-                    // have been quiet long enough (and we are not mid-abort).
+                    // Silence: IDLE iff the trailing prompt is on the current
+                    // (uncommitted) line and we have been quiet long enough and
+                    // we are not mid-abort.
                     if interrupted_at.is_none()
                         && last_activity.elapsed() >= self.config.idle_silence
                     {
@@ -196,7 +228,8 @@ impl Wrapper {
                             .iter()
                             .map(String::as_str)
                             .collect();
-                        if line_ends_with_any(&self.sanitizer.clean_log(), &tokens) {
+                        if line_ends_with_any(&self.sanitizer.current_line(), &tokens) {
+                            self.state = State::Idle;
                             return Ok(Outcome::Idle);
                         }
                     }
@@ -262,6 +295,31 @@ mod tests {
     }
 
     #[test]
+    fn answers_two_identical_confirmation_prompts() {
+        // Regression: the dedup must re-arm so a second, byte-identical prompt
+        // is also answered (it previously hung until the watchdog).
+        let mut w = wrapper(
+            "sh",
+            &[
+                "-c",
+                "for i in 1 2; do printf 'Continue? [y/n] '; read a; printf 'A%s=%s\\n' \"$i\" \"$a\"; done",
+            ],
+            WrapperConfig::default(),
+        );
+        let outcome = w.wait_until_idle().expect("wait");
+        assert_eq!(outcome, Outcome::Completed);
+        let log = w.clean_log();
+        assert!(
+            log.contains("A1=y"),
+            "first prompt not answered; log: {log:?}"
+        );
+        assert!(
+            log.contains("A2=y"),
+            "second prompt not answered; log: {log:?}"
+        );
+    }
+
+    #[test]
     fn detects_idle_via_trailing_prompt_and_silence() {
         // Print a prompt then idle (without exiting). The wrapper should reach
         // IDLE on the prompt + silence, not wait for the long sleep to finish.
@@ -277,6 +335,7 @@ mod tests {
         let start = Instant::now();
         let outcome = w.wait_until_idle().expect("wait");
         assert_eq!(outcome, Outcome::Idle);
+        assert_eq!(w.state(), State::Idle);
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "took too long to detect idle: {:?}",
