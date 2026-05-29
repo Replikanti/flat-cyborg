@@ -443,8 +443,8 @@ mod tests {
         assert!(!s.feed(b"\r")); // CR — cursor only
         assert!(!s.feed(b"\x1b[2C")); // CUF — cursor only
         assert!(!s.feed(b"\x08")); // BS — cursor only
-        // Repainting the exact same content is NOT a change (lets a
-        // timer-repaint TUI settle).
+                                   // Repainting the exact same content is NOT a change (lets a
+                                   // timer-repaint TUI settle).
         assert!(!s.feed(b"\x1b[1;1Hhello"));
         // Erasing the line that holds content IS a change.
         assert!(s.feed(b"\x1b[1;1H\x1b[2K"));
