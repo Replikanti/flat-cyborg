@@ -1,0 +1,75 @@
+name: CI — Rust
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/ci.yml'
+
+concurrency:
+  group: ci-rust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # Fast-path: PR and branch pushes run debug-mode tests. Release-mode
+      # tests run only on tag pushes (v*), right before a version is cut, to
+      # catch any optimizer-specific bugs.
+      - name: Test (debug — PR / branch push)
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        run: cargo test
+        timeout-minutes: 6
+      - name: Test (release — tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: cargo test --release
+        timeout-minutes: 8
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      # Install precompiled cargo-audit + cargo-deny instead of compiling
+      # them from source. taiki-e/install-action downloads prebuilt binaries.
+      - name: Install cargo-audit and cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      # Cache the rustsec advisory database between runs so cargo-audit
+      # doesn't refetch it each time. Rotate the cache per run id with a
+      # restore-key fallback so it stays warm without lingering stale.
+      - name: Cache rustsec advisory-db
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/advisory-db
+          key: advisory-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            advisory-db-${{ runner.os }}-
+      - run: cargo audit
+      - run: cargo deny check

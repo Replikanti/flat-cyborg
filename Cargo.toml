@@ -1,0 +1,20 @@
+[package]
+name = "flat-cyborg"
+version = "0.1.0"
+edition = "2021"
+description = "Asynchronous PTY wrapper for bidirectional I/O interception of interactive CLI applications"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Replikanti/flat-cyborg"
+publish = false
+
+[lib]
+name = "flat_cyborg"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flat-cyborg"
+path = "src/main.rs"
+
+[dependencies]
+
+[dev-dependencies]
