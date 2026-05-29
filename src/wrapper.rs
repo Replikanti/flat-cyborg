@@ -163,11 +163,13 @@ impl Wrapper {
         let start = Instant::now();
         let mut last_activity = Instant::now();
         let mut interrupted_at: Option<Instant> = None;
-        // Whether the confirmation prompt currently on screen has already been
-        // answered. Re-armed once the current line stops looking like a prompt,
-        // so a *new* confirmation (even one with identical text) is answered
-        // again, while the echoed reply does not trigger a second answer.
-        let mut answered = false;
+        // The commit index of the prompt line we last answered. A prompt's
+        // identity is the number of committed lines beneath it, which advances
+        // with every newline regardless of how output is chunked. This answers
+        // each distinct confirmation exactly once — even two byte-identical
+        // prompts, and even when the intervening output coalesces into a single
+        // read so the non-prompt state is never observed on its own.
+        let mut answered_at: Option<usize> = None;
         self.state = State::Running;
 
         loop {
@@ -195,12 +197,16 @@ impl Wrapper {
                     let line = self.sanitizer.current_line();
                     if is_confirmation_prompt(&line) {
                         self.state = State::ConfirmationPrompt;
-                        if self.config.auto_confirm && interrupted_at.is_none() && !answered {
+                        let prompt_id = self.sanitizer.committed_lines();
+                        if self.config.auto_confirm
+                            && interrupted_at.is_none()
+                            && answered_at != Some(prompt_id)
+                        {
                             // Reply `y\r` through the jitter layer (per spec).
                             let session = &self.session;
                             self.jitter
                                 .type_command("y", |bytes| session.write_input(bytes))?;
-                            answered = true;
+                            answered_at = Some(prompt_id);
                             last_activity = Instant::now();
                             // The jittered reply may have slept; re-check the
                             // deadline so it cannot push the first escalation
@@ -210,9 +216,6 @@ impl Wrapper {
                                 interrupted_at = Some(Instant::now());
                             }
                         }
-                    } else {
-                        // No longer at a confirmation prompt: re-arm.
-                        answered = false;
                     }
                 }
                 Output::Idle => {
