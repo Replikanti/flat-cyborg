@@ -4,23 +4,10 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'deny.toml'
-      - 'rust-toolchain.toml'
-      - '.github/workflows/ci.yml'
+  # Run on every pull request. We deliberately do not filter by path: `check`
+  # and `audit` are required status checks, and a PR that touches none of the
+  # filtered paths would leave them perpetually "Expected", blocking the merge.
   pull_request:
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'deny.toml'
-      - 'rust-toolchain.toml'
-      - '.github/workflows/ci.yml'
 
 concurrency:
   group: ci-rust-${{ github.ref }}
