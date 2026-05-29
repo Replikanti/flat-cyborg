@@ -47,8 +47,9 @@ OPTIONS:
     --no-confirm        Do not auto-answer [y/n] confirmation prompts.
     --tui               Full-screen TUI mode: capture via a 2D screen grid and
                         treat a settled screen as idle (for apps using the
-                        alternate screen / cursor addressing). Prints the
-                        rendered screen instead of the line log.
+                        alternate screen / cursor addressing). Prints the final
+                        rendered screen instead of the line log. A continuously
+                        animated TUI may never settle — raise --idle-ms for it.
     -h, --help          Print this help.
 
 COMMANDS:
@@ -192,6 +193,12 @@ fn run(args: Args) -> flat_cyborg::Result<ExitCode> {
     if !args.cmds.is_empty() {
         orchestrate(session, args)
     } else if rustix::termios::isatty(rustix::stdio::stdin()) {
+        if args.config.tui {
+            eprintln!(
+                "flat-cyborg: --tui has no effect in interactive passthrough mode \
+                 (it applies to --cmd orchestration and piped capture)"
+            );
+        }
         interactive(session)
     } else {
         capture(session, args)

@@ -94,7 +94,8 @@ pub enum Outcome {
 pub struct Wrapper {
     session: PtySession,
     sanitizer: Sanitizer,
-    screen: Screen,
+    /// 2D screen grid, allocated only in TUI mode.
+    screen: Option<Screen>,
     jitter: Jitter,
     config: WrapperConfig,
     state: State,
@@ -108,10 +109,13 @@ impl Wrapper {
 
     /// Wraps `session` with an explicit configuration.
     pub fn with_config(session: PtySession, config: WrapperConfig) -> Self {
+        // The grid matches the session's default PTY geometry; only needed in
+        // TUI mode.
+        let screen = config.tui.then(|| Screen::new(DEFAULT_ROWS, DEFAULT_COLS));
         Self {
             session,
             sanitizer: Sanitizer::new(),
-            screen: Screen::new(DEFAULT_ROWS, DEFAULT_COLS),
+            screen,
             jitter: Jitter::new(),
             config,
             state: State::Running,
@@ -134,9 +138,9 @@ impl Wrapper {
     }
 
     /// The current visible screen rendered as text. Meaningful in `--tui` mode,
-    /// where output is captured through the 2D screen grid.
+    /// where output is captured through the 2D screen grid; empty otherwise.
     pub fn screen_text(&self) -> String {
-        self.screen.text()
+        self.screen.as_ref().map(Screen::text).unwrap_or_default()
     }
 
     /// Mutable access to the underlying session.
@@ -220,7 +224,7 @@ impl Wrapper {
                     // works); the screen grid only in TUI mode.
                     let sani_changed = self.sanitizer.feed(&chunk);
                     let changed = if self.config.tui {
-                        self.screen.feed(&chunk)
+                        self.screen.as_mut().is_some_and(|s| s.feed(&chunk))
                     } else {
                         sani_changed
                     };
