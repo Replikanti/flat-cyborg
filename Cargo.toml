@@ -16,5 +16,7 @@ name = "flat-cyborg"
 path = "src/main.rs"
 
 [dependencies]
+pty-process = { version = "0.5.3", features = ["async"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "process", "time", "sync"] }
 
 [dev-dependencies]
