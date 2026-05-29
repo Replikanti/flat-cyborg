@@ -1,5 +1,11 @@
 # flat-cyborg
 
+[![CI](https://github.com/Replikanti/flat-cyborg/actions/workflows/ci.yml/badge.svg)](https://github.com/Replikanti/flat-cyborg/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Replikanti/flat-cyborg)](https://github.com/Replikanti/flat-cyborg/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Replikanti/flat-cyborg/total)](https://github.com/Replikanti/flat-cyborg/releases)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
+
 An asynchronous pseudo-terminal (PTY) wrapper, written in Rust, for
 bidirectional I/O interception of interactive command-line applications.
 
