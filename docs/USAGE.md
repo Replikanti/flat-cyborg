@@ -207,4 +207,3 @@ back to `sudo` if the install directory is not writable).
 | LLM CLI stuck on a "trust this folder" screen | Run it in a directory it already trusts (the menu is arrow-key driven and cannot be auto-answered). |
 | `--tui` "has no effect" warning | `--tui` applies to `--cmd` orchestration and piped capture, not interactive passthrough. |
 | Typed command seems to race the UI | The target needs longer to render before input; raise `--idle-ms`. |
-```
