@@ -62,19 +62,33 @@ struct Args {
     program_args: Vec<String>,
 }
 
-fn parse_args() -> Result<Option<Args>, String> {
+/// What the parsed command line asks for.
+enum Mode {
+    Help,
+    Version,
+    Run(Args),
+}
+
+fn parse_args() -> Result<Mode, String> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
 
-    // Split on the first `--` first, so `-h`/`--help` is only honored when it
-    // belongs to flat-cyborg (before `--`), never when it is an argument to the
-    // target program.
+    // Split on the first `--` first, so flat-cyborg's own flags (`-h`/`--help`,
+    // `--version`/`-V`) are only honored before it, never when they are
+    // arguments to the target program after `--`.
     let split = raw.iter().position(|a| a == "--");
     let opts_slice = match split {
         Some(s) => &raw[..s],
         None => &raw[..],
     };
     if opts_slice.iter().any(|a| a == "-h" || a == "--help") {
-        return Ok(None);
+        return Ok(Mode::Help);
+    }
+    // `version` as a bare subcommand, or the `--version`/`-V` flags (scoped
+    // before `--`, like `--help`).
+    if (split.is_none() && raw.first().map(String::as_str) == Some("version"))
+        || opts_slice.iter().any(|a| a == "--version" || a == "-V")
+    {
+        return Ok(Mode::Version);
     }
 
     let Some(split) = split else {
@@ -124,7 +138,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         config.prompt_tokens = prompts;
     }
 
-    Ok(Some(Args {
+    Ok(Mode::Run(Args {
         cmds,
         config,
         program: rest[0].clone(),
@@ -133,25 +147,24 @@ fn parse_args() -> Result<Option<Args>, String> {
 }
 
 fn main() -> ExitCode {
-    // Subcommands are dispatched before wrapper-argument parsing. They only fire
-    // when they are the first token; to wrap a program literally named `update`
-    // or `version`, use the `--` form (e.g. `flat-cyborg -- update`).
+    // `update` is dispatched first (it consumes its own arguments). It only
+    // fires as the first token; to wrap a program literally named `update`, use
+    // the `--` form (e.g. `flat-cyborg -- update`).
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    match argv.first().map(String::as_str) {
-        Some("update") => return update::cmd_update(&argv[1..]),
-        Some("version") | Some("--version") | Some("-V") => {
-            println!("flat-cyborg {}", flat_cyborg::VERSION);
-            return ExitCode::SUCCESS;
-        }
-        _ => {}
+    if argv.first().map(String::as_str) == Some("update") {
+        return update::cmd_update(&argv[1..]);
     }
 
     let args = match parse_args() {
-        Ok(None) => {
+        Ok(Mode::Help) => {
             print!("{HELP}");
             return ExitCode::SUCCESS;
         }
-        Ok(Some(args)) => args,
+        Ok(Mode::Version) => {
+            println!("flat-cyborg {}", flat_cyborg::VERSION);
+            return ExitCode::SUCCESS;
+        }
+        Ok(Mode::Run(args)) => args,
         Err(e) => {
             eprintln!("flat-cyborg: {e}\n");
             eprint!("{HELP}");

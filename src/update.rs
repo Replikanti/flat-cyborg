@@ -16,7 +16,6 @@ use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
 const REPO: &str = "Replikanti/flat-cyborg";
-const ETXTBSY: i32 = 26;
 
 /// Entry point for the `update` subcommand.
 pub fn cmd_update(args: &[String]) -> ExitCode {
@@ -52,36 +51,74 @@ fn run_update(check_only: bool) -> Result<ExitCode, String> {
 
     let asset = asset_name()?;
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");
+    let url = format!("{base}/{asset}");
 
     let current_exe =
         std::env::current_exe().map_err(|e| format!("cannot locate current executable: {e}"))?;
 
-    // Download next to the running binary so a later rename stays on the same
-    // filesystem; fall back to the system temp dir if that directory is not
-    // writable (the replace step then uses copy/sudo).
-    let same_dir_tmp = current_exe.with_file_name(".flat-cyborg-update.tmp");
-    let tmp = if fetch_to_file(&format!("{base}/{asset}"), &same_dir_tmp).is_ok() {
-        same_dir_tmp
+    // Prefer staging next to the running binary: that directory is on the same
+    // filesystem (so the final install is an atomic rename) and, for a system
+    // install like /usr/local/bin, is not world-writable (so no /tmp symlink
+    // race). If it is not writable, fall back to a private 0700 temp dir and
+    // install via sudo.
+    let in_dir = current_exe.with_file_name(format!(".flat-cyborg-update-{}", std::process::id()));
+    let (staged, privileged) = if fetch_to_file(&url, &in_dir).is_ok() {
+        (in_dir, false)
     } else {
-        let fallback = std::env::temp_dir().join(".flat-cyborg-update.tmp");
-        fetch_to_file(&format!("{base}/{asset}"), &fallback)?;
-        fallback
+        let dir = make_private_dir()?;
+        let staged = dir.join(&asset);
+        if let Err(e) = fetch_to_file(&url, &staged) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+        (staged, true)
     };
 
-    if let Err(e) = verify_checksum(&base, &asset, &tmp) {
-        let _ = std::fs::remove_file(&tmp);
+    let cleanup = || {
+        let _ = std::fs::remove_file(&staged);
+        if privileged {
+            if let Some(parent) = staged.parent() {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+    };
+
+    if let Err(e) = verify_checksum(&base, &asset, &staged) {
+        cleanup();
+        return Err(e);
+    }
+    if let Err(e) = set_executable(&staged) {
+        cleanup();
         return Err(e);
     }
 
-    set_executable(&tmp)?;
-
-    if let Err(e) = replace_executable(&tmp, &current_exe) {
-        let _ = std::fs::remove_file(&tmp);
+    let result = if privileged {
+        sudo_replace(&staged, &current_exe)
+    } else {
+        replace_executable(&staged, &current_exe)
+    };
+    if let Err(e) = result {
+        cleanup();
         return Err(e);
     }
+    cleanup();
 
     println!("Updated flat-cyborg to {latest}.");
     Ok(ExitCode::SUCCESS)
+}
+
+/// Creates an exclusively-owned `0700` directory under the system temp dir for
+/// staging when the install directory is not writable.
+fn make_private_dir() -> Result<std::path::PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("flat-cyborg-update-{}", std::process::id()));
+    // Remove a stale dir left by a previous run with the same pid, then create
+    // exclusively (create_dir fails on an existing path or a symlink).
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).map_err(|e| format!("cannot create staging dir: {e}"))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("cannot secure staging dir: {e}"))?;
+    Ok(dir)
 }
 
 /// Verifies `tmp` against the release `.sha256`. Fails closed: a missing
@@ -122,47 +159,69 @@ fn verify_checksum(base: &str, asset: &str, tmp: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Atomically replaces `current_exe` with `tmp`, handling a running-binary
-/// rename failure (Linux `ETXTBSY`) and falling back to `sudo`.
-fn replace_executable(tmp: &Path, current_exe: &Path) -> Result<(), String> {
-    match std::fs::rename(tmp, current_exe) {
-        Ok(()) => return Ok(()),
-        Err(e) if e.raw_os_error() == Some(ETXTBSY) || cross_device(&e) => {
-            // A running ELF can't be renamed over; unlink first (the kernel
-            // keeps the inode alive for the running process), then copy.
-            if std::fs::remove_file(current_exe).is_ok() && std::fs::copy(tmp, current_exe).is_ok()
-            {
-                let _ = std::fs::remove_file(tmp);
-                return Ok(());
-            }
-        }
-        Err(_) => {}
-    }
+/// Installs `staged` as `current_exe` using **rename-aside**: the live binary
+/// is moved aside, the new one is renamed into the now-empty path, and the
+/// backup is deleted. On failure the backup is restored, so the user is never
+/// left without a working binary. `staged` must be on the same filesystem as
+/// `current_exe` (the caller stages it in the install directory).
+///
+/// Moving the running binary *away* is permitted on Linux (unlike renaming
+/// *over* it, which fails with `ETXTBSY`), so this path avoids `ETXTBSY` by
+/// construction.
+fn replace_executable(staged: &Path, current_exe: &Path) -> Result<(), String> {
+    let backup = current_exe.with_file_name(format!(".flat-cyborg-old-{}", std::process::id()));
 
-    // Permission or other failure: retry with sudo (rm + cp).
-    eprintln!("Permission required - retrying with sudo...");
-    let _ = Command::new("sudo")
-        .arg("rm")
-        .arg("-f")
-        .arg(current_exe)
-        .status();
-    let status = Command::new("sudo")
-        .arg("cp")
-        .arg(tmp)
-        .arg(current_exe)
-        .status()
-        .map_err(|e| format!("failed to run sudo: {e}"))?;
-    let _ = std::fs::remove_file(tmp);
-    if status.success() {
-        Ok(())
-    } else {
-        Err("sudo cp failed - update aborted".into())
+    std::fs::rename(current_exe, &backup)
+        .map_err(|e| format!("cannot move the current binary aside: {e}"))?;
+
+    match std::fs::rename(staged, current_exe) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup);
+            Ok(())
+        }
+        Err(e) => {
+            // Put the original back; the install is never left empty.
+            let _ = std::fs::rename(&backup, current_exe);
+            Err(format!(
+                "failed to install the new binary (original restored): {e}"
+            ))
+        }
     }
 }
 
-fn cross_device(e: &std::io::Error) -> bool {
-    // EXDEV (cross-device link) when tmp landed in a different filesystem.
-    e.raw_os_error() == Some(18)
+/// Privileged variant of [`replace_executable`] for a non-writable install
+/// directory. Uses `sudo mv` (rename-aside), so the install is never left
+/// empty and a running ELF is moved aside rather than overwritten.
+fn sudo_replace(staged: &Path, current_exe: &Path) -> Result<(), String> {
+    let backup = current_exe.with_file_name(format!(".flat-cyborg-old-{}", std::process::id()));
+    eprintln!("Permission required - installing with sudo...");
+
+    if !sudo_mv(current_exe, &backup) {
+        return Err("sudo: could not move the current binary aside - update aborted".into());
+    }
+    if sudo_mv(staged, current_exe) {
+        let _ = Command::new("sudo")
+            .arg("rm")
+            .arg("-f")
+            .arg(&backup)
+            .status();
+        Ok(())
+    } else {
+        // Restore the original.
+        let _ = sudo_mv(&backup, current_exe);
+        Err("sudo: failed to install the new binary (original restored)".into())
+    }
+}
+
+fn sudo_mv(from: &Path, to: &Path) -> bool {
+    Command::new("sudo")
+        .arg("mv")
+        .arg("-f")
+        .arg(from)
+        .arg(to)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn set_executable(path: &Path) -> Result<(), String> {
@@ -205,9 +264,20 @@ fn parse_tag_name(json: &str) -> Option<String> {
     Some(after_open[..end].to_string())
 }
 
-/// Whether release tag `latest` is a newer version than `current`.
+/// Whether release tag `latest` is a newer version than `current`. Components
+/// are compared left to right, treating a missing component as zero, so `1.0`
+/// and `1.0.0` compare equal.
 fn is_newer(latest: &str, current: &str) -> bool {
-    parse_version(latest) > parse_version(current)
+    let l = parse_version(latest);
+    let c = parse_version(current);
+    for i in 0..l.len().max(c.len()) {
+        let a = l.get(i).copied().unwrap_or(0);
+        let b = c.get(i).copied().unwrap_or(0);
+        if a != b {
+            return a > b;
+        }
+    }
+    false
 }
 
 fn parse_version(s: &str) -> Vec<u64> {
@@ -313,6 +383,11 @@ mod tests {
         assert!(!is_newer("v0.1.0", "0.2.0"));
         // Pre-release suffix on the patch is ignored.
         assert!(!is_newer("v0.1.0-rc1", "0.1.0"));
+        // Differing component counts: missing components are treated as zero.
+        assert!(!is_newer("v1.0", "1.0.0"));
+        assert!(!is_newer("v1.0.0", "1.0"));
+        assert!(is_newer("v1.0.1", "1.0"));
+        assert!(is_newer("v1.1", "1.0.9"));
     }
 
     #[test]

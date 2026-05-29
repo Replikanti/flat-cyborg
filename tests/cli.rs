@@ -49,6 +49,38 @@ fn help_after_separator_is_not_hijacked() {
 }
 
 #[test]
+fn version_prints_and_is_not_hijacked_after_separator() {
+    // `version` subcommand prints the crate version.
+    let out = Command::new(bin())
+        .arg("version")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run version");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("flat-cyborg "),
+        "version output: {stdout:?}"
+    );
+
+    // `--version` *after* `--` belongs to the target, not flat-cyborg.
+    // `printf '%s\n' --version` echoes the literal operand (unlike `echo`,
+    // whose GNU build would interpret `--version`).
+    let out = Command::new(bin())
+        .args(["--", "printf", "%s\\n", "--version"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--version"), "stdout: {stdout:?}");
+    assert!(
+        !stdout.contains("flat-cyborg 0"),
+        "flat-cyborg version was hijacked: {stdout:?}"
+    );
+}
+
+#[test]
 fn capture_mode_propagates_target_exit_code() {
     let out = Command::new(bin())
         .args(["--", "sh", "-c", "exit 7"])
