@@ -129,3 +129,22 @@ fn capture_mode_prints_sanitized_output() {
         "ANSI escape leaked into output: {stdout:?}"
     );
 }
+
+#[test]
+fn response_marker_extracts_only_marked_lines() {
+    let out = Command::new(bin())
+        .args([
+            "--response-marker",
+            "@@",
+            "--",
+            "sh",
+            "-c",
+            "printf 'noise\\n@@ first\\nmore noise\\n@@ second\\n'",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout, "first\nsecond\n", "got: {stdout:?}");
+}

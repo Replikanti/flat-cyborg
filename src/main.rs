@@ -50,6 +50,9 @@ OPTIONS:
                         alternate screen / cursor addressing). Prints the final
                         rendered screen instead of the line log. A continuously
                         animated TUI may never settle — raise --idle-ms for it.
+    --response-marker <S> Print only captured lines whose first non-blank
+                        content starts with <S>, with <S> stripped (e.g.
+                        '●' to extract an assistant's reply lines).
     -h, --help          Print this help.
 
 COMMANDS:
@@ -63,6 +66,7 @@ runs the target to completion and prints its sanitized output.
 struct Args {
     cmds: Vec<String>,
     config: WrapperConfig,
+    response_marker: Option<String>,
     program: String,
     program_args: Vec<String>,
 }
@@ -108,6 +112,7 @@ fn parse_args() -> Result<Mode, String> {
     let mut cmds = Vec::new();
     let mut config = WrapperConfig::default();
     let mut prompts: Vec<String> = Vec::new();
+    let mut response_marker: Option<String> = None;
 
     let mut i = 0;
     while i < opts.len() {
@@ -135,6 +140,7 @@ fn parse_args() -> Result<Mode, String> {
             }
             "--no-confirm" => config.auto_confirm = false,
             "--tui" => config.tui = true,
+            "--response-marker" => response_marker = Some(take_value("--response-marker")?),
             other => return Err(format!("unknown option: {other}")),
         }
         i += 1;
@@ -147,6 +153,7 @@ fn parse_args() -> Result<Mode, String> {
     Ok(Mode::Run(Args {
         cmds,
         config,
+        response_marker,
         program: rest[0].clone(),
         program_args: rest[1..].to_vec(),
     }))
@@ -208,6 +215,7 @@ fn run(args: Args) -> flat_cyborg::Result<ExitCode> {
 /// Orchestrator mode: type each command and wait for the target between them.
 fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     let tui = args.config.tui;
+    let marker = args.response_marker.clone();
     let mut wrapper = Wrapper::with_config(session, args.config);
     let mut last = Outcome::Completed;
     for cmd in &args.cmds {
@@ -216,23 +224,39 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
             break;
         }
     }
-    print_capture(&wrapper, tui);
+    print_capture(&wrapper, tui, marker.as_deref());
     Ok(exit_code_for(&mut wrapper, last))
 }
 
 /// Capture mode: run the target to completion, print its sanitized output.
 fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     let tui = args.config.tui;
+    let marker = args.response_marker.clone();
     let mut wrapper = Wrapper::with_config(session, args.config);
     let outcome = wrapper.wait_until_idle()?;
-    print_capture(&wrapper, tui);
+    print_capture(&wrapper, tui, marker.as_deref());
     Ok(exit_code_for(&mut wrapper, outcome))
 }
 
 /// Prints the captured output: the rendered screen in TUI mode, otherwise the
 /// line-oriented sanitized log.
-fn print_capture(wrapper: &Wrapper, tui: bool) {
-    if tui {
+fn print_capture(wrapper: &Wrapper, tui: bool, marker: Option<&str>) {
+    if let Some(m) = marker {
+        let text = if tui {
+            wrapper.screen_text()
+        } else {
+            wrapper.clean_log()
+        };
+        let out: String = text
+            .lines()
+            .filter_map(|line| {
+                let t = line.trim_start();
+                t.strip_prefix(m).map(|rest| rest.trim_start().to_string())
+            })
+            .map(|s| s + "\n")
+            .collect();
+        print!("{out}");
+    } else if tui {
         println!("{}", wrapper.screen_text());
     } else {
         print!("{}", wrapper.clean_log());
