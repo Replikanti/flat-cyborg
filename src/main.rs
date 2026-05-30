@@ -26,6 +26,7 @@ use std::time::Duration;
 use flat_cyborg::pty::Output;
 use flat_cyborg::{Outcome, PtySession, RawModeGuard, Wrapper, WrapperConfig};
 
+mod extract;
 mod update;
 
 const HELP: &str = "\
@@ -50,9 +51,11 @@ OPTIONS:
                         alternate screen / cursor addressing). Prints the final
                         rendered screen instead of the line log. A continuously
                         animated TUI may never settle — raise --idle-ms for it.
-    --extract           Wrap each --cmd so the target fences its reply between
-                        unique markers, and print only the fenced reply
-                        (the way to capture a multi-line LLM answer; needs --cmd).
+    --extract           Print only the model's reply. Wraps each --cmd prompt
+                        with unique markers and prints the fenced reply; for
+                        known CLIs (claude, codex) falls back to structural
+                        screen extraction if the model omits the markers. Never
+                        prints UI chrome (needs --cmd).
     -h, --help          Print this help.
 
 COMMANDS:
@@ -181,17 +184,6 @@ fn wrap_command(cmd: &str, begin: &str, end: &str) -> String {
     )
 }
 
-/// Extracts the text between the LAST begin/end marker pair in `text`. Using the
-/// last pair skips the echoed instruction (which appears earlier in the
-/// transcript) and grabs the model's actual fenced reply. Returns `None` if
-/// either marker is missing.
-fn extract_between(text: &str, begin: &str, end: &str) -> Option<String> {
-    let e = text.rfind(end)?; // last END
-    let b = text[..e].rfind(begin)?; // last BEGIN before it
-    let inner = &text[b + begin.len()..e];
-    Some(inner.trim().to_string())
-}
-
 fn main() -> ExitCode {
     // `update` is dispatched first (it consumes its own arguments). It only
     // fires as the first token; to wrap a program literally named `update`, use
@@ -248,15 +240,17 @@ fn run(args: Args) -> flat_cyborg::Result<ExitCode> {
 /// Orchestrator mode: type each command and wait for the target between them.
 fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     let tui = args.config.tui;
-    // Generate the per-run sentinel pair once so the same markers are used both
-    // for wrapping the typed --cmd and for extracting the reply afterwards.
+    let program = args.program.clone();
+    // With --extract we ALWAYS wrap the prompt with a per-run sentinel pair (for
+    // every target, including known CLIs): the markers are self-validating and
+    // are tried first when extracting. The pair is generated once so the same
+    // markers are used for both wrapping and extraction.
     let sentinels = args.extract.then(sentinels);
     let mut wrapper = Wrapper::with_config(session, args.config);
     let mut last = Outcome::Completed;
     for cmd in &args.cmds {
-        // With --extract, append a wrap instruction so the target fences its
-        // reply between the per-run markers. Kept a CLI concern; the wrapper
-        // library stays unaware of sentinels.
+        // Wrapping (when used) is kept a CLI concern; the wrapper library stays
+        // unaware of sentinels.
         let effective = match &sentinels {
             Some((begin, end)) => wrap_command(cmd, begin, end),
             None => cmd.clone(),
@@ -266,40 +260,59 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
             break;
         }
     }
-    print_capture(&wrapper, tui, sentinels.as_ref());
+    print_capture(&wrapper, tui, sentinels.as_ref(), &program);
     Ok(exit_code_for(&mut wrapper, last))
 }
 
 /// Capture mode: run the target to completion, print its sanitized output.
 fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     let tui = args.config.tui;
+    let program = args.program.clone();
     // --extract has nothing to wrap here (no --cmd selects orchestrator mode),
-    // but extraction from the captured output is still honored.
-    let sentinels = args.extract.then(sentinels);
+    // so there are no sentinel markers in the output; extraction will fall back
+    // to structural for a known CLI, or warn.
     let mut wrapper = Wrapper::with_config(session, args.config);
     let outcome = wrapper.wait_until_idle()?;
-    print_capture(&wrapper, tui, sentinels.as_ref());
+    print_capture(
+        &wrapper,
+        tui,
+        args.extract.then(sentinels).as_ref(),
+        &program,
+    );
     Ok(exit_code_for(&mut wrapper, outcome))
 }
 
 /// Prints the captured output: the rendered screen in TUI mode, otherwise the
 /// line-oriented sanitized log.
 ///
-/// With `--extract` (via `sentinels`) it reads the full transcript (including
-/// scrolled-off lines in TUI mode) and prints only the text between the last
-/// marker pair; otherwise it prints the plain output.
-fn print_capture(wrapper: &Wrapper, tui: bool, sentinels: Option<&(String, String)>) {
+/// With `--extract` (`sentinels` present) it uses the sentinel-first hybrid
+/// ([`extract::choose_reply`]): the fenced reply between the last marker pair if
+/// the model honored the wrap, otherwise a sanity-checked structural slice for a
+/// known CLI, otherwise nothing (with a warning). It never prints UI chrome.
+/// Without `--extract` it prints the plain captured output.
+///
+/// The full transcript (including lines scrolled off the top in TUI mode) is
+/// used for extraction so long multi-line replies are captured whole.
+fn print_capture(
+    wrapper: &Wrapper,
+    tui: bool,
+    sentinels: Option<&(String, String)>,
+    program: &str,
+) {
     if let Some((begin, end)) = sentinels {
         let text = if tui {
             wrapper.screen_full_text()
         } else {
             wrapper.clean_log()
         };
-        match extract_between(&text, begin, end) {
+        match extract::choose_reply(program, &text, begin, end) {
             Some(s) => println!("{s}"),
+            // Neither the sentinel nor a clean structural slice yielded a reply.
+            // Print nothing (never chrome) and warn.
             None => eprintln!(
-                "flat-cyborg: --extract markers not found in output \
-                 (the target may not have followed the wrap instruction)"
+                "flat-cyborg: --extract found no clean reply (the target did not \
+                 emit the markers and no chrome-free structural fallback was \
+                 available)"
             ),
         }
         io::stdout().flush().ok();
@@ -380,44 +393,6 @@ fn interactive(session: PtySession) -> flat_cyborg::Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extract_between_picks_last_pair() {
-        // The transcript contains the echoed instruction (an earlier mention of
-        // the markers in prose) followed by the model's real fenced reply.
-        let begin = "FCB_abc123_BEGIN";
-        let end = "FCB_abc123_END";
-        let transcript = format!(
-            "> summarize\n\nIMPORTANT: wrap between {begin} and {end}.\n\
-             {begin}\nLine one of the answer.\nLine two of the answer.\n{end}\n"
-        );
-        let got = extract_between(&transcript, begin, end).unwrap();
-        assert_eq!(got, "Line one of the answer.\nLine two of the answer.");
-    }
-
-    #[test]
-    fn extract_between_multiline_reply_retained() {
-        let begin = "FCB_x_BEGIN";
-        let end = "FCB_x_END";
-        let body: Vec<String> = (0..50).map(|i| format!("answer line {i}")).collect();
-        let joined = body.join("\n");
-        let transcript = format!("noise before\n{begin}\n{joined}\n{end}\ntrailing noise");
-        let got = extract_between(&transcript, begin, end).unwrap();
-        assert_eq!(got, joined);
-    }
-
-    #[test]
-    fn extract_between_missing_markers_is_none() {
-        assert_eq!(extract_between("no markers here", "B", "E"), None);
-    }
-
-    #[test]
-    fn extract_between_only_one_marker_is_none() {
-        // BEGIN present but no END.
-        assert_eq!(extract_between("FCB_B reply text", "FCB_B", "FCB_E"), None);
-        // END present but no BEGIN.
-        assert_eq!(extract_between("reply text FCB_E", "FCB_B", "FCB_E"), None);
-    }
 
     #[test]
     fn sentinels_are_distinct_ascii() {
