@@ -143,6 +143,16 @@ impl Wrapper {
         self.screen.as_ref().map(Screen::text).unwrap_or_default()
     }
 
+    /// The full transcript including lines that scrolled off the top of the
+    /// viewport. Meaningful in `--tui` mode; empty otherwise. Used by
+    /// `--extract` to capture long multi-line replies.
+    pub fn screen_full_text(&self) -> String {
+        self.screen
+            .as_ref()
+            .map(Screen::full_text)
+            .unwrap_or_default()
+    }
+
     /// Mutable access to the underlying session.
     pub fn session(&mut self) -> &mut PtySession {
         &mut self.session

@@ -26,12 +26,19 @@
 
 use crate::ansi::{Parser, Perform};
 
+/// Upper bound on retained scrolled-off lines. Bounds memory for very long
+/// streaming replies; oldest lines are dropped once this is exceeded.
+const MAX_SCROLLBACK: usize = 10_000;
+
 /// A fixed-size character grid with a cursor.
 #[derive(Clone)]
 struct Grid {
     rows: usize,
     cols: usize,
     cells: Vec<Vec<char>>,
+    /// Lines that have scrolled off the top of the viewport, oldest first.
+    /// Retained so the full transcript of a long reply can be reconstructed.
+    scrollback: Vec<Vec<char>>,
     row: usize,
     col: usize,
     /// Saved cursor for DECSC/DECRC (`ESC[s` / `ESC[u`), per buffer — kept
@@ -46,6 +53,7 @@ impl Grid {
             rows,
             cols,
             cells: vec![vec![' '; cols]; rows],
+            scrollback: Vec::new(),
             row: 0,
             col: 0,
             decsc: (0, 0),
@@ -58,6 +66,7 @@ impl Grid {
                 *cell = ' ';
             }
         }
+        self.scrollback.clear();
         self.row = 0;
         self.col = 0;
     }
@@ -80,8 +89,13 @@ impl Grid {
     /// `true` if a scroll occurred (a visible content change).
     fn line_feed(&mut self) -> bool {
         if self.row + 1 >= self.rows {
-            // Scroll up: drop the top line, append a blank bottom line.
-            self.cells.remove(0);
+            // Scroll up: evict the top line into scrollback so the full
+            // transcript is retained, then append a blank bottom line.
+            let evicted = self.cells.remove(0);
+            self.scrollback.push(evicted);
+            if self.scrollback.len() > MAX_SCROLLBACK {
+                self.scrollback.remove(0);
+            }
             self.cells.push(vec![' '; self.cols]);
             true
         } else {
@@ -157,6 +171,25 @@ impl Grid {
         let mut lines: Vec<String> = self
             .cells
             .iter()
+            .map(|row| {
+                let s: String = row.iter().collect();
+                s.trim_end().to_string()
+            })
+            .collect();
+        while lines.last().map(String::is_empty).unwrap_or(false) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
+    /// Renders the full transcript: scrolled-off lines followed by the current
+    /// viewport, each trimmed of trailing spaces and trailing blank lines
+    /// dropped. Unlike [`render`], this includes everything that scrolled away.
+    fn render_full(&self) -> String {
+        let mut lines: Vec<String> = self
+            .scrollback
+            .iter()
+            .chain(self.cells.iter())
             .map(|row| {
                 let s: String = row.iter().collect();
                 s.trim_end().to_string()
@@ -248,6 +281,17 @@ impl Screen {
             self.alternate.render()
         } else {
             self.primary.render()
+        }
+    }
+
+    /// The full transcript of the active grid, including lines that scrolled off
+    /// the top of the viewport. Mirrors [`text`] in choosing primary vs
+    /// alternate. Used by `--extract` to capture long multi-line replies.
+    pub fn full_text(&self) -> String {
+        if self.in_alternate {
+            self.alternate.render_full()
+        } else {
+            self.primary.render_full()
         }
     }
 }
@@ -475,5 +519,60 @@ mod tests {
         let mut s = Screen::new(2, 20);
         s.feed(b"\x1b[31mred\x1b[0m text");
         assert_eq!(s.text(), "red text");
+    }
+
+    #[test]
+    fn full_text_retains_scrolled_off_lines() {
+        // 2-row viewport; feed five lines so three scroll off the top.
+        let mut s = Screen::new(2, 5);
+        s.feed(b"a\r\nb\r\nc\r\nd\r\ne");
+        // Viewport keeps only the last two lines.
+        assert_eq!(s.text(), "d\ne");
+        // Full transcript keeps every line in order.
+        assert_eq!(s.full_text(), "a\nb\nc\nd\ne");
+    }
+
+    #[test]
+    fn full_text_line_count_matches_feeds() {
+        // Feed many more lines than the viewport has rows; all must be retained.
+        let rows = 3;
+        let n = 250;
+        let mut s = Screen::new(rows as u16, 8);
+        let mut input = String::new();
+        for i in 0..n {
+            if i > 0 {
+                input.push_str("\r\n");
+            }
+            input.push_str(&format!("L{i}"));
+        }
+        s.feed(input.as_bytes());
+        let full = s.full_text();
+        assert_eq!(full.lines().count(), n);
+        assert!(full.starts_with("L0\n"));
+        assert!(full.ends_with(&format!("L{}", n - 1)));
+        // Viewport shows only the last `rows` lines.
+        assert_eq!(s.text().lines().count(), rows);
+    }
+
+    #[test]
+    fn scrollback_cap_keeps_most_recent_without_panic() {
+        // Feed far more lines than MAX_SCROLLBACK to exercise front-eviction.
+        let total = MAX_SCROLLBACK + 50;
+        let mut s = Screen::new(2, 6);
+        let mut input = String::new();
+        for i in 0..total {
+            if i > 0 {
+                input.push_str("\r\n");
+            }
+            input.push_str(&format!("n{i}"));
+        }
+        s.feed(input.as_bytes());
+        let full = s.full_text();
+        // Scrollback is capped, so the earliest lines are dropped, but the most
+        // recent line is always present.
+        assert!(full.ends_with(&format!("n{}", total - 1)));
+        assert!(!full.contains("n0\n"));
+        // Bounded: at most cap scrollback lines plus the viewport rows.
+        assert!(full.lines().count() <= MAX_SCROLLBACK + 2);
     }
 }
