@@ -80,7 +80,7 @@ flat-cyborg picks a mode automatically:
 | `--idle-ms <N>` | How long output must be silent before the target is considered idle (default 500). Raise it for slow or animated targets. |
 | `--prompt <TOKEN>` | Trailing prompt token that marks idle (repeatable; defaults to common shell prompts `$ `, `# `, `> `, `% `). |
 | `--no-confirm` | Do not auto-answer `[y/n]` confirmation prompts (by default they are answered `y`). |
-| `--extract` | The reply-extraction mechanism (see below): wraps each `--cmd` so the target fences its reply between unique per-run markers, then prints only the fenced reply. Requires `--cmd`. |
+| `--extract` | The reply-extraction mechanism (see below): wraps each `--cmd` so the target fences its reply between unique per-run markers and prints only the fenced reply; for known CLIs (claude, codex) it falls back to structural screen extraction if the model omits the markers, and never prints UI chrome. Requires `--cmd`. |
 | `--tui` | Full-screen TUI mode (see below). |
 | `-h`, `--help` | Print help. |
 
@@ -104,12 +104,27 @@ raise `--idle-ms`, or it will hit `--timeout-ms`.
 You can wrap an LLM coding CLI, send it a prompt, and capture just its answer
 with `--extract`.
 
-`--extract` rewrites each `--cmd` so the model fences its reply between unique,
-per-run markers, then prints only the text between those markers. Because the
-markers are injected into the prompt rather than scraped from the CLI's visible
-UI, this works for **any** LLM CLI, captures **multi-line** answers in full, and
-(thanks to the virtual terminal's scrollback) handles **long** answers that
-scroll off the visible screen.
+`--extract` works in two layers, sentinel-first:
+
+1. **Sentinel (primary, LLM-agnostic).** It rewrites each `--cmd` so the model
+   fences its reply between unique, per-run markers, then prints only the text
+   between those markers. Because the markers are injected into the prompt
+   rather than scraped from the CLI's visible UI, this works for **any** LLM
+   CLI, captures **multi-line** answers in full, and (thanks to the virtual
+   terminal's scrollback) handles **long** answers that scroll off screen.
+2. **Structural fallback (known CLIs only).** Some CLIs ignore the wrap
+   instruction for longer answers (codex does). When the markers are absent and
+   the target is a known CLI (`claude`, `codex`), flat-cyborg falls back to
+   slicing the reply out of the rendered screen by recognizing that tool's
+   chrome. The sliced result is accepted only if it passes a strict cleanliness
+   check (no UI glyphs, separators, banners, or runaway lines) — so a fallback
+   never emits chrome. If neither layer yields a clean reply, flat-cyborg prints
+   nothing and warns on stderr.
+
+The structural fallback is per-CLI and recognizes the current claude/codex UI,
+so it may need updating if those tools redesign their interface; the sentinel
+layer and the cleanliness check bound the blast radius (worst case is a loud
+warning, never garbage).
 
 Example — ask Claude Code one thing and print only its reply:
 
@@ -127,8 +142,9 @@ finish rendering, then flat-cyborg types the wrapped prompt, waits for the
 answer, and prints only what the model fenced between the markers.
 
 `--extract` needs at least one `--cmd` (it has to have a prompt to wrap). If the
-markers are not found in the output — for example the model did not follow the
-wrap instruction — flat-cyborg prints nothing to stdout and warns on stderr.
+markers are not found and the structural fallback cannot produce a clean reply,
+flat-cyborg prints nothing to stdout and warns on stderr — it never dumps the
+raw screen.
 
 Without `--extract`, `--tui` prints the **entire** final screen (banner, input
 box, status bar, and the reply); `--extract` is what narrows it to just the
