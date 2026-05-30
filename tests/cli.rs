@@ -156,8 +156,8 @@ fn extract_without_markers_warns_and_prints_nothing() {
     assert!(out.status.success(), "exit: {:?}", out.status);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("markers not found"),
-        "expected a not-found warning, got stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr).contains("no clean reply"),
+        "expected a no-clean-reply warning, got stderr: {:?}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
