@@ -63,13 +63,13 @@ flat-cyborg -- sh -c 'printf "\033[32mhello\033[0m\n"'
 # Drive an interactive shell non-interactively:
 flat-cyborg --cmd 'echo hi' --cmd 'exit' -- sh -i
 
-# Wrap an LLM CLI's full-screen UI and capture just its reply:
-flat-cyborg --tui --profile claude --idle-ms 4000 \
+# Wrap an LLM CLI and capture just its reply:
+flat-cyborg --tui --extract --idle-ms 4000 \
   --cmd 'Reply with one word: pineapple' -- claude
 ```
 
 See the [**Usage Guide**](docs/USAGE.md) for the full reference — modes, every
-option, `--tui` and `--profile`, exit codes, self-update, and troubleshooting.
+option, `--tui` and `--extract`, exit codes, self-update, and troubleshooting.
 
 Update an installed binary with `flat-cyborg update` (`flat-cyborg version` to
 check the installed version).

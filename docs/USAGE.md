@@ -10,7 +10,7 @@ interactive CLI non-interactively, or capture its output cleanly.
 - [Quick start](#quick-start)
 - [Modes](#modes)
 - [Options](#options)
-- [Driving an LLM CLI (claude, codex)](#driving-an-llm-cli-claude-codex)
+- [Driving an LLM CLI (claude, codex, ...)](#driving-an-llm-cli-claude-codex-)
 - [Exit codes](#exit-codes)
 - [Self-update](#self-update)
 - [How it works](#how-it-works)
@@ -80,8 +80,7 @@ flat-cyborg picks a mode automatically:
 | `--idle-ms <N>` | How long output must be silent before the target is considered idle (default 500). Raise it for slow or animated targets. |
 | `--prompt <TOKEN>` | Trailing prompt token that marks idle (repeatable; defaults to common shell prompts `$ `, `# `, `> `, `% `). |
 | `--no-confirm` | Do not auto-answer `[y/n]` confirmation prompts (by default they are answered `y`). |
-| `--profile <NAME>` | Settings bundle for a known LLM CLI (see below). Currently sets `--response-marker`. |
-| `--response-marker <S>` | Print only captured lines whose first non-blank content starts with `S`, with `S` stripped. Extracts an assistant's reply lines. |
+| `--extract` | The reply-extraction mechanism (see below): wraps each `--cmd` so the target fences its reply between unique per-run markers, then prints only the fenced reply. Requires `--cmd`. |
 | `--tui` | Full-screen TUI mode (see below). |
 | `-h`, `--help` | Print help. |
 
@@ -100,23 +99,23 @@ Claude Code's UI). For those, pass `--tui`:
 A continuously-animated TUI (a spinner that never stops) may never settle —
 raise `--idle-ms`, or it will hit `--timeout-ms`.
 
-## Driving an LLM CLI (claude, codex)
+## Driving an LLM CLI (claude, codex, ...)
 
-You can wrap an LLM coding CLI, send it a prompt, and capture just its answer.
+You can wrap an LLM coding CLI, send it a prompt, and capture just its answer
+with `--extract`.
 
-`--profile <name>` is a convenience bundle for a known LLM CLI. Today it sets
-the `--response-marker` to the glyph that tool prefixes its reply lines with:
-
-| `--profile` | reply glyph |
-|------------|-------------|
-| `claude`   | `●` |
-| `codex`    | `•` |
+`--extract` rewrites each `--cmd` so the model fences its reply between unique,
+per-run markers, then prints only the text between those markers. Because the
+markers are injected into the prompt rather than scraped from the CLI's visible
+UI, this works for **any** LLM CLI, captures **multi-line** answers in full, and
+(thanks to the virtual terminal's scrollback) handles **long** answers that
+scroll off the visible screen.
 
 Example — ask Claude Code one thing and print only its reply:
 
 ```sh
 cd ~/your/project        # a directory the CLI already trusts (see note)
-flat-cyborg --tui --profile claude --idle-ms 4000 --timeout-ms 120000 \
+flat-cyborg --tui --extract --idle-ms 4000 --timeout-ms 120000 \
   --cmd 'Reply with exactly one word: pineapple' \
   -- claude
 # -> pineapple
@@ -124,18 +123,15 @@ flat-cyborg --tui --profile claude --idle-ms 4000 --timeout-ms 120000 \
 
 What happens: flat-cyborg starts `claude` in a PTY, so it detects a terminal
 and launches its **interactive** UI (not headless). `--tui` waits for the UI to
-finish rendering, types the prompt, waits for the answer, and `--profile claude`
-filters the captured screen down to claude's reply lines.
+finish rendering, then flat-cyborg types the wrapped prompt, waits for the
+answer, and prints only what the model fenced between the markers.
 
-If a tool's reply glyph changes, or for any CLI without a built-in profile, set
-the marker yourself — `--response-marker` always overrides a profile:
+`--extract` needs at least one `--cmd` (it has to have a prompt to wrap). If the
+markers are not found in the output — for example the model did not follow the
+wrap instruction — flat-cyborg prints nothing to stdout and warns on stderr.
 
-```sh
-flat-cyborg --tui --response-marker '●' --idle-ms 4000 --cmd '...' -- some-llm-cli
-```
-
-Without any marker, `--tui` prints the **entire** final screen (banner, input
-box, status bar, and the reply); the marker is what narrows it to just the
+Without `--extract`, `--tui` prints the **entire** final screen (banner, input
+box, status bar, and the reply); `--extract` is what narrows it to just the
 answer.
 
 > **Note on onboarding.** Run the LLM CLI in a directory it already trusts.
@@ -144,11 +140,10 @@ answer.
 > `--tui` will wait on until it times out.
 
 This is a best-effort, generic capability — flat-cyborg has no app-specific
-code, only the small `--profile` table plus the generic `--response-marker`. A
-full-screen TUI is not an API; a CLI's UI can change between versions. For
-robust automation prefer a tool's own non-interactive/headless mode or API when
-one exists; use flat-cyborg when it does not, or when you specifically need the
-interactive path.
+code; `--extract` is fully LLM-agnostic. A full-screen TUI is not an API; a
+CLI's UI can change between versions. For robust automation prefer a tool's own
+non-interactive/headless mode or API when one exists; use flat-cyborg when it
+does not, or when you specifically need the interactive path.
 
 ## Exit codes
 
@@ -203,7 +198,7 @@ back to `sudo` if the install directory is not writable).
 | Symptom | Likely cause / fix |
 |---------|--------------------|
 | Exit `124`, no output | The target never reached idle. Raise `--idle-ms` and/or `--timeout-ms`; for a full-screen TUI add `--tui`. |
-| `--tui` capture is full of UI chrome | Add `--profile <name>` or `--response-marker <glyph>` to keep only reply lines. |
+| `--tui` capture is full of UI chrome | Add `--extract` (with `--cmd`) to print only the model's fenced reply. |
 | LLM CLI stuck on a "trust this folder" screen | Run it in a directory it already trusts (the menu is arrow-key driven and cannot be auto-answered). |
 | `--tui` "has no effect" warning | `--tui` applies to `--cmd` orchestration and piped capture, not interactive passthrough. |
 | Typed command seems to race the UI | The target needs longer to render before input; raise `--idle-ms`. |
