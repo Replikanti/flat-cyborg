@@ -198,3 +198,35 @@ fn unknown_profile_is_an_error() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown --profile"));
 }
+
+#[test]
+fn no_extract_output_unchanged() {
+    // Regression: without --extract, capture-mode output is the cleaned log
+    // verbatim — the new flag must not alter the default path.
+    let out = Command::new(bin())
+        .args(["--", "sh", "-c", "printf 'plain output\\nmore\\n'"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "plain output\nmore\n");
+}
+
+#[test]
+fn extract_without_markers_warns_and_prints_nothing() {
+    // The per-run markers are random, so a static target cannot reproduce them.
+    // When the markers are absent from the output, --extract prints nothing to
+    // stdout and emits a clear warning on stderr.
+    let out = Command::new(bin())
+        .args(["--extract", "--", "sh", "-c", "printf 'no markers here\\n'"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("markers not found"),
+        "expected a not-found warning, got stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
