@@ -166,6 +166,11 @@ answer.
 > agent's own safety gates** (including for destructive actions), so use it
 > deliberately — prefer running the agent in a mode/dir that does not prompt
 > when you do not need it.
+>
+> Multi-step agent runs also need a **larger `--idle-ms`**: the agent goes quiet
+> for several seconds between steps (thinking, running a tool), and a small idle
+> window makes flat-cyborg declare IDLE mid-run and cut the capture short. For
+> agentic git/PR workflows use `--idle-ms 12000` or more.
 
 This is a best-effort, generic capability — flat-cyborg has no app-specific
 code; `--extract` is fully LLM-agnostic. A full-screen TUI is not an API; a
