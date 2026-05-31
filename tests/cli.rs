@@ -131,6 +131,37 @@ fn capture_mode_prints_sanitized_output() {
 }
 
 #[test]
+fn cwd_runs_target_in_the_given_directory() {
+    // Capture mode (piped stdin): `--cwd /tmp` makes the target's `pwd` print
+    // the override, not flat-cyborg's own working directory. `/tmp` is
+    // dash-safe and present on every Unix test host.
+    let out = Command::new(bin())
+        .args(["--cwd", "/tmp", "--", "sh", "-c", "pwd"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run with --cwd");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("/tmp"),
+        "target did not run in --cwd: {stdout:?}"
+    );
+}
+
+#[test]
+fn cwd_nonexistent_is_a_usage_error() {
+    // A missing --cwd directory is a usage error: exit 2 with a clear message.
+    let out = Command::new(bin())
+        .args(["--cwd", "/nonexistent-XYZ", "--", "sh", "-c", "true"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run with bad --cwd");
+    assert_eq!(out.status.code(), Some(2), "expected usage exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cwd does not exist"), "stderr: {stderr:?}");
+}
+
+#[test]
 fn no_extract_output_unchanged() {
     // Regression: without --extract, capture-mode output is the cleaned log
     // verbatim — the new flag must not alter the default path.

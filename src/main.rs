@@ -46,6 +46,11 @@ OPTIONS:
     --prompt <TOKEN>    Trailing prompt token for IDLE detection (repeatable;
                         defaults to common shell prompts).
     --no-confirm        Do not auto-answer [y/n] confirmation prompts.
+    --cwd <DIR>         Run the target with this working directory (default:
+                        inherit flat-cyborg's).
+    --auto-approve      Auto-confirm agent approval menus (e.g. codex git-push,
+                        claude trust). Bypasses the agent's safety gates —
+                        opt-in. Off by default.
     --tui               Full-screen TUI mode: capture via a 2D screen grid and
                         treat a settled screen as idle (for apps using the
                         alternate screen / cursor addressing). Prints the final
@@ -70,6 +75,7 @@ struct Args {
     cmds: Vec<String>,
     config: WrapperConfig,
     extract: bool,
+    cwd: Option<String>,
     program: String,
     program_args: Vec<String>,
 }
@@ -116,6 +122,7 @@ fn parse_args() -> Result<Mode, String> {
     let mut config = WrapperConfig::default();
     let mut prompts: Vec<String> = Vec::new();
     let mut extract = false;
+    let mut cwd: Option<String> = None;
 
     let mut i = 0;
     while i < opts.len() {
@@ -142,6 +149,8 @@ fn parse_args() -> Result<Mode, String> {
                 config.idle_silence = Duration::from_millis(ms);
             }
             "--no-confirm" => config.auto_confirm = false,
+            "--auto-approve" => config.auto_approve = true,
+            "--cwd" => cwd = Some(take_value("--cwd")?),
             "--tui" => config.tui = true,
             "--extract" => extract = true,
             other => return Err(format!("unknown option: {other}")),
@@ -153,10 +162,18 @@ fn parse_args() -> Result<Mode, String> {
         config.prompt_tokens = prompts;
     }
 
+    // Validate `--cwd` here (a usage error → exit 2), before spawning.
+    if let Some(dir) = &cwd {
+        if !std::path::Path::new(dir).is_dir() {
+            return Err(format!("cwd does not exist: {dir}"));
+        }
+    }
+
     Ok(Mode::Run(Args {
         cmds,
         config,
         extract,
+        cwd,
         program: rest[0].clone(),
         program_args: rest[1..].to_vec(),
     }))
@@ -220,7 +237,13 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Args) -> flat_cyborg::Result<ExitCode> {
-    let session = PtySession::spawn(&args.program, &args.program_args)?;
+    let session = PtySession::spawn_in(
+        &args.program,
+        &args.program_args,
+        args.cwd.as_deref().map(std::path::Path::new),
+        flat_cyborg::pty::DEFAULT_ROWS,
+        flat_cyborg::pty::DEFAULT_COLS,
+    )?;
 
     if !args.cmds.is_empty() {
         orchestrate(session, args)

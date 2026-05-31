@@ -80,6 +80,8 @@ flat-cyborg picks a mode automatically:
 | `--idle-ms <N>` | How long output must be silent before the target is considered idle (default 500). Raise it for slow or animated targets. |
 | `--prompt <TOKEN>` | Trailing prompt token that marks idle (repeatable; defaults to common shell prompts `$ `, `# `, `> `, `% `). |
 | `--no-confirm` | Do not auto-answer `[y/n]` confirmation prompts (by default they are answered `y`). |
+| `--cwd <DIR>` | Run the target with this working directory, instead of inheriting flat-cyborg's own. Useful when you launch flat-cyborg from a parent directory but want the target (e.g. an agent) to act on a specific repo. The directory must exist (a missing one is a usage error, exit `2`). |
+| `--auto-approve` | Auto-confirm agent **approval / trust menus** — the arrow-key numbered menus that agentic CLIs show for actions the `[y/n]` auto-confirm cannot answer (e.g. codex's `git push` confirmation, claude's "trust this folder" prompt) — by pressing Enter on the default "yes/proceed/trust" option. **Bypasses the agent's own safety gates (including for destructive actions), so it is opt-in and off by default.** |
 | `--extract` | The reply-extraction mechanism (see below): wraps each `--cmd` so the target fences its reply between unique per-run markers and prints only the fenced reply; for known CLIs (claude, codex) it falls back to structural screen extraction if the model omits the markers, and never prints UI chrome. Requires `--cmd`. |
 | `--tui` | Full-screen TUI mode (see below). |
 | `-h`, `--help` | Print help. |
@@ -150,10 +152,25 @@ Without `--extract`, `--tui` prints the **entire** final screen (banner, input
 box, status bar, and the reply); `--extract` is what narrows it to just the
 answer.
 
-> **Note on onboarding.** Run the LLM CLI in a directory it already trusts.
-> On first use in a new directory, these tools show an arrow-key "trust this
-> folder" menu (not a `[y/n]` prompt), which the auto-confirm cannot answer and
-> `--tui` will wait on until it times out.
+> **Note on onboarding.** Run the LLM CLI in a directory it already trusts, or
+> point it at one with `--cwd <repo>`. On first use in a new directory, these
+> tools show an arrow-key "trust this folder" menu (not a `[y/n]` prompt), which
+> the `[y/n]` auto-confirm cannot answer; `--tui` would otherwise wait on it
+> until it times out. Pass `--auto-approve` to have flat-cyborg confirm such
+> menus for you (see the safety note below).
+
+> **Note on multi-step agent actions.** When you drive an agent to write files,
+> run `git`, or open a PR, it may pause on an arrow-key **approval menu** (e.g.
+> codex confirming a `git push`) that the `[y/n]` auto-confirm cannot answer.
+> Pass `--auto-approve` to confirm these automatically. This **bypasses the
+> agent's own safety gates** (including for destructive actions), so use it
+> deliberately — prefer running the agent in a mode/dir that does not prompt
+> when you do not need it.
+>
+> Multi-step agent runs also need a **larger `--idle-ms`**: the agent goes quiet
+> for several seconds between steps (thinking, running a tool), and a small idle
+> window makes flat-cyborg declare IDLE mid-run and cut the capture short. For
+> agentic git/PR workflows use `--idle-ms 12000` or more.
 
 This is a best-effort, generic capability — flat-cyborg has no app-specific
 code; `--extract` is fully LLM-agnostic. A full-screen TUI is not an API; a
@@ -215,6 +232,8 @@ back to `sudo` if the install directory is not writable).
 |---------|--------------------|
 | Exit `124`, no output | The target never reached idle. Raise `--idle-ms` and/or `--timeout-ms`; for a full-screen TUI add `--tui`. |
 | `--tui` capture is full of UI chrome | Add `--extract` (with `--cmd`) to print only the model's fenced reply. |
-| LLM CLI stuck on a "trust this folder" screen | Run it in a directory it already trusts (the menu is arrow-key driven and cannot be auto-answered). |
+| LLM CLI stuck on a "trust this folder" screen | The menu is arrow-key driven, so the `[y/n]` auto-confirm cannot answer it. Run the CLI in a directory it already trusts, or pass `--auto-approve` to confirm the trust menu (it bypasses the agent's safety gate, so use deliberately). |
+| Agent stalls on an approval menu (codex `git push`, etc.) | Pass `--auto-approve` to auto-confirm agent approval/trust menus. **It bypasses the agent's safety gates** (including destructive actions); alternatively run the agent in a pre-trusted dir or a mode that does not prompt. |
+| Target says "not a git repository" / acts on the wrong directory | flat-cyborg inherits its own working directory by default, so an agent launched from a parent dir sees the wrong CWD. Point the target explicitly with `--cwd <repo>`. |
 | `--tui` "has no effect" warning | `--tui` applies to `--cmd` orchestration and piped capture, not interactive passthrough. |
 | Typed command seems to race the UI | The target needs longer to render before input; raise `--idle-ms`. |

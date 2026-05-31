@@ -23,7 +23,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::ansi::{is_confirmation_prompt, line_ends_with_any, Sanitizer};
+use crate::ansi::{is_approval_menu, is_confirmation_prompt, line_ends_with_any, Sanitizer};
 use crate::error::Result;
 use crate::jitter::Jitter;
 use crate::pty::{Output, PtySession, DEFAULT_COLS, DEFAULT_ROWS};
@@ -44,6 +44,14 @@ pub struct WrapperConfig {
     pub prompt_tokens: Vec<String>,
     /// Whether to auto-answer confirmation prompts with `y\r`.
     pub auto_confirm: bool,
+    /// Whether to auto-confirm agentic-CLI **approval / trust menus** (the
+    /// arrow-key numbered menus a `[y/n]` reply cannot answer, e.g. codex's
+    /// `git push` confirmation or claude's "trust this folder" prompt) by
+    /// pressing Enter on the default "yes/proceed/trust" option.
+    ///
+    /// Off by default: confirming such a menu bypasses the agent's own safety
+    /// gate (including for destructive actions), so it is strictly opt-in.
+    pub auto_approve: bool,
     /// Full-screen TUI mode: capture output through a 2D screen grid and treat
     /// a settled screen (quiet for `idle_silence`) as IDLE, rather than looking
     /// for a line-oriented trailing prompt.
@@ -62,6 +70,7 @@ impl Default for WrapperConfig {
                 .map(|s| s.to_string())
                 .collect(),
             auto_confirm: true,
+            auto_approve: false,
             tui: false,
         }
     }
@@ -206,6 +215,11 @@ impl Wrapper {
         // prompts, and even when the intervening output coalesces into a single
         // read so the non-prompt state is never observed on its own.
         let mut answered_at: Option<usize> = None;
+        // Approval-menu de-dup (opt-in `auto_approve`). The menus are
+        // full-screen and have no stable commit index, so the guard is a simple
+        // edge latch: confirm once while the menu is on screen, then re-arm only
+        // after it has gone (the menu's text is no longer detected).
+        let mut approval_answered = false;
         // TUI settle detection must not fire before the screen has rendered at
         // least once.
         let mut saw_output = false;
@@ -267,6 +281,31 @@ impl Wrapper {
                                     interrupted_at = Some(Instant::now());
                                 }
                             }
+                        }
+                    }
+
+                    // Opt-in: auto-confirm agentic-CLI approval / trust menus
+                    // (arrow-key numbered menus the `[y/n]` path above cannot
+                    // answer). These are full-screen, so detection reads the
+                    // grid in TUI mode and the sanitized log otherwise. We press
+                    // Enter (`\r`) to confirm the default "yes/proceed/trust"
+                    // option. An edge latch confirms each menu exactly once and
+                    // re-arms only once the menu has left the screen.
+                    if self.config.auto_approve && interrupted_at.is_none() {
+                        let screen = if self.config.tui {
+                            self.screen_text()
+                        } else {
+                            self.sanitizer.clean_log()
+                        };
+                        if is_approval_menu(&screen) {
+                            self.state = State::ConfirmationPrompt;
+                            if !approval_answered {
+                                let _ = self.session.write_input(b"\r");
+                                approval_answered = true;
+                                last_activity = Instant::now();
+                            }
+                        } else {
+                            approval_answered = false;
                         }
                     }
                 }
