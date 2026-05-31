@@ -31,7 +31,7 @@ mod parser;
 mod sanitize;
 mod strip;
 
-pub use detect::{is_confirmation_prompt, line_ends_with_any};
+pub use detect::{is_approval_menu, is_confirmation_prompt, line_ends_with_any};
 pub(crate) use parser::{Parser, Perform};
 pub use sanitize::Sanitizer;
 pub use strip::{strip_ansi, AnsiStripper};

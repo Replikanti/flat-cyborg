@@ -19,6 +19,7 @@
 use crate::error::{Error, Result};
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -112,17 +113,47 @@ impl PtySession {
         I: IntoIterator<Item = A>,
         A: AsRef<OsStr>,
     {
+        Self::spawn_in(program, args, None, rows, cols)
+    }
+
+    /// Spawns `program` with `args` inside a PTY of the given geometry,
+    /// optionally overriding the child's working directory.
+    ///
+    /// When `cwd` is `Some(dir)`, the child runs in `dir`; when `None`, it
+    /// inherits the host's working directory (as [`spawn`](Self::spawn) and
+    /// [`spawn_with_size`](Self::spawn_with_size) do). The child inherits the
+    /// host's environment regardless; `TERM` is set to [`TERM`].
+    ///
+    /// # Errors
+    /// Returns an error if the PTY cannot be allocated or resized, or if the
+    /// child process fails to spawn.
+    pub fn spawn_in<S, I, A>(
+        program: S,
+        args: I,
+        cwd: Option<&Path>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Self>
+    where
+        S: AsRef<OsStr>,
+        I: IntoIterator<Item = A>,
+        A: AsRef<OsStr>,
+    {
         let (pty, pts) = pty_process::blocking::open()?;
         pty.resize(Size::new(rows, cols))?;
 
         // `pty_process::blocking::Command` wraps `std::process::Command`, which
-        // inherits the parent CWD and environment by default. We only set TERM.
-        // The child is made a session leader (it gets the slave as controlling
-        // terminal), so its process-group id equals its pid — see `Drop`.
-        let child = pty_process::blocking::Command::new(program)
-            .args(args)
-            .env("TERM", TERM)
-            .spawn(pts)?;
+        // inherits the parent CWD and environment by default. We only set TERM,
+        // and override the working directory when `cwd` is given. Its builder
+        // methods consume and return `self`, so they are chained. The child is
+        // made a session leader (it gets the slave as controlling terminal), so
+        // its process-group id equals its pid — see `Drop`.
+        let mut command = pty_process::blocking::Command::new(program);
+        command = command.args(args).env("TERM", TERM);
+        if let Some(dir) = cwd {
+            command = command.current_dir(dir);
+        }
+        let child = command.spawn(pts)?;
 
         // `Read`/`Write` are implemented for `&Pty`, so the two threads can
         // share the master via `Arc` without any interior mutability. The PTY
@@ -404,6 +435,22 @@ mod tests {
     fn spawn_reports_child_id() {
         let session = PtySession::spawn("sh", ["-c", "sleep 1"]).expect("spawn");
         assert!(session.child_id() > 0);
+    }
+
+    #[test]
+    fn spawn_in_runs_target_in_the_given_cwd() {
+        // With an explicit cwd, the child sees that directory rather than the
+        // host's. `/tmp` is dash-safe and present on every Unix test host.
+        let session = PtySession::spawn_in(
+            "sh",
+            ["-c", "pwd"],
+            Some(Path::new("/tmp")),
+            DEFAULT_ROWS,
+            DEFAULT_COLS,
+        )
+        .expect("spawn in /tmp");
+        let out = read_until(&session, "/tmp", Duration::from_secs(5));
+        assert!(out.contains("/tmp"), "target cwd not honored: {out:?}");
     }
 
     #[test]
