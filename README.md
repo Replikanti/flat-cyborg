@@ -81,6 +81,12 @@ cargo build
 cargo test
 ```
 
+End-to-end smoke tests: `scripts/smoke-local.sh` drives the built binary
+against `sh`/`cat` targets (deterministic, no network — also run in CI), and
+`scripts/smoke-llm.sh` drives real `claude`/`codex` CLIs to check
+`--extract`/`--auto-approve` (opt-in; needs the CLIs installed and a trusted
+working directory).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or

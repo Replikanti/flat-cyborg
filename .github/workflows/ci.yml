@@ -36,6 +36,14 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: cargo test --release
         timeout-minutes: 8
+      # End-to-end smoke tests against a real built binary (sh/cat targets,
+      # no network, no LLM). The LLM smoke script (scripts/smoke-llm.sh) is
+      # opt-in and intentionally not run in CI.
+      - name: Build binary for smoke tests
+        run: cargo build --bin flat-cyborg
+      - name: Smoke tests (local)
+        run: ./scripts/smoke-local.sh ./target/debug/flat-cyborg
+        timeout-minutes: 2
 
   audit:
     runs-on: ubuntu-latest
