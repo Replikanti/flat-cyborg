@@ -800,25 +800,34 @@ mod tests {
 
     #[test]
     fn claude_like_scroll_region_stream_is_fully_captured() {
-        // Synthesize the observed Claude Code shape on a small screen: enter the
-        // alternate screen, clear, set a scroll region, move into it, then stream a
-        // leading sentinel, K numbered lines (K > region height), and a trailing
-        // sentinel. Before the fix the early lines and BEGIN sentinel were dropped.
+        // Faithfully reproduce Claude Code's scrolling shape: it scrolls the
+        // region with `CSI <n>S` (SU) and repaints each new line at the region's
+        // bottom row with absolute addressing — it does NOT line-feed (`\n`) the
+        // content through. The pre-fix emulator ignored `CSI S`, so every repaint
+        // overwrote the same row and the earlier lines (and the BEGIN sentinel)
+        // were lost; this test therefore FAILS on the old code path and is a true
+        // regression guard, not just a `full_text()` tautology.
         let rows: u16 = 6;
         let mut s = Screen::new(rows, 16);
         s.feed(b"\x1b[?1049h\x1b[2J\x1b[H");
-        // Region rows 2..5 (1-based) → height 4, smaller than the stream length.
+        // Region rows 2..5 (1-based) → 0-based 1..=4, height 4 (< stream length).
         s.feed(b"\x1b[2;5r");
-        s.feed(b"\x1b[2;1H"); // move into the region top
-        let k = 20;
-        let mut stream = String::from("FCB_TST_BEGIN");
-        for i in 1..=k {
-            stream.push_str("\r\n");
-            stream.push_str(&i.to_string());
-        }
-        stream.push_str("\r\nFCB_TST_END");
-        s.feed(stream.as_bytes());
 
+        // Painted lines, in order: a leading sentinel, K numbers, a trailing
+        // sentinel — each delivered the way Claude does it (SU, then paint at the
+        // region's bottom row), never via `\n`.
+        let k = 20;
+        let mut painted: Vec<String> = Vec::with_capacity(k + 2);
+        painted.push("FCB_TST_BEGIN".to_string());
+        painted.extend((1..=k).map(|i| i.to_string()));
+        painted.push("FCB_TST_END".to_string());
+        for line in &painted {
+            s.feed(b"\x1b[1S"); // SU: evict the region-top line into scrollback
+            s.feed(b"\x1b[5;1H"); // cursor to the region bottom (1-based row 5)
+            s.feed(line.as_bytes());
+        }
+
+        // full_text() = scrollback + viewport must reconstruct the whole stream.
         let full = s.full_text();
         assert!(
             full.contains("FCB_TST_BEGIN"),
@@ -839,5 +848,17 @@ mod tests {
         let begin_at = full.find("FCB_TST_BEGIN").unwrap();
         let end_at = full.find("FCB_TST_END").unwrap();
         assert!(begin_at < end_at, "sentinels out of order: {full:?}");
+
+        // The viewport (text()) tracks the most-recent lines: the trailing
+        // sentinel is visible and the leading one has scrolled off.
+        let view = s.text();
+        assert!(
+            view.contains("FCB_TST_END"),
+            "END not in viewport: {view:?}"
+        );
+        assert!(
+            !view.contains("FCB_TST_BEGIN"),
+            "BEGIN should have scrolled off the viewport: {view:?}"
+        );
     }
 }
