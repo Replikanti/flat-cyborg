@@ -242,21 +242,51 @@ impl Grid {
     /// Renders the full transcript: scrolled-off lines followed by the current
     /// viewport, each trimmed of trailing spaces and trailing blank lines
     /// dropped. Unlike [`render`], this includes everything that scrolled away.
+    ///
+    /// The scrollback/viewport seam is reconciled: an app that scrolls its region
+    /// with SU and then repaints the just-scrolled lines (e.g. Claude Code) stores
+    /// the boundary line(s) twice — once evicted into `scrollback`, once repainted
+    /// in the viewport. The longest suffix of `scrollback` that re-appears as the
+    /// (leading-blank-skipped) prefix of the viewport is dropped. For ordinary
+    /// line-fed streams the overlap is 0, so the transcript is unchanged. (If a
+    /// reply genuinely repeats lines exactly at the seam, those collapse too — a
+    /// rare, bounded over-merge, strictly better than a guaranteed duplicate.)
     fn render_full(&self) -> String {
-        let mut lines: Vec<String> = self
-            .scrollback
+        let render = |rows: &[Vec<char>]| -> Vec<String> {
+            rows.iter()
+                .map(|row| {
+                    let s: String = row.iter().collect();
+                    s.trim_end().to_string()
+                })
+                .collect()
+        };
+        let scrollback = render(&self.scrollback);
+        let viewport = render(&self.cells);
+        let vp_start = viewport
             .iter()
-            .chain(self.cells.iter())
-            .map(|row| {
-                let s: String = row.iter().collect();
-                s.trim_end().to_string()
-            })
-            .collect();
+            .position(|l| !l.is_empty())
+            .unwrap_or(viewport.len());
+        let overlap = seam_overlap(&scrollback, &viewport[vp_start..]);
+        let mut lines = scrollback;
+        lines.extend_from_slice(&viewport[..vp_start]);
+        lines.extend_from_slice(&viewport[vp_start + overlap..]);
         while lines.last().map(String::is_empty).unwrap_or(false) {
             lines.pop();
         }
         lines.join("\n")
     }
+}
+
+/// Longest `L` such that the last `L` lines of `sb` equal the first `L` lines of
+/// `vp`. Used to reconcile the scrollback/viewport seam in [`Grid::render_full`].
+fn seam_overlap(sb: &[String], vp: &[String]) -> usize {
+    let max_l = sb.len().min(vp.len());
+    for l in (1..=max_l).rev() {
+        if sb[sb.len() - l..] == vp[..l] {
+            return l;
+        }
+    }
+    0
 }
 
 /// A screen-grid terminal emulator.
@@ -799,6 +829,119 @@ mod tests {
     }
 
     #[test]
+    fn seam_overlap_basic() {
+        let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+        // No shared boundary lines → 0.
+        assert_eq!(seam_overlap(&v(&["a", "b", "c"]), &v(&["x", "y"])), 0);
+        // The single suffix line of `sb` equals the single prefix line of `vp` → 1.
+        assert_eq!(seam_overlap(&v(&["a", "b", "c"]), &v(&["c", "d", "e"])), 1);
+        // Two suffix lines equal two prefix lines → 2 (and the longest run wins).
+        assert_eq!(seam_overlap(&v(&["a", "b", "c"]), &v(&["b", "c", "d"])), 2);
+        // Empty inputs (either side) → 0.
+        assert_eq!(seam_overlap(&[], &v(&["a"])), 0);
+        assert_eq!(seam_overlap(&v(&["a"]), &[]), 0);
+        assert_eq!(seam_overlap(&[], &[]), 0);
+    }
+
+    #[test]
+    fn render_full_dedups_su_repaint_seam() {
+        // Reproduce Claude Code's SU-then-repaint shape and force a boundary line to
+        // land in BOTH scrollback (evicted by SU) and the viewport (repainted), then
+        // assert the seam line survives exactly once in full_text(), in order.
+        let mut s = Screen::new(6, 16);
+        s.feed(b"\x1b[?1049h\x1b[2J\x1b[H");
+        s.feed(b"\x1b[2;5r"); // region rows 2..5 (1-based) => 0-based 1..=4
+        let top = 2u16; // 1-based region top
+        let bottom = 5u16; // 1-based region bottom
+        let height = (bottom - top + 1) as usize; // 4
+        let k = 8usize;
+        // Repaint the whole visible window: rows top..=bottom show lines
+        // (last-height+1)..=last, blanking lines first like a real frame redraw.
+        let repaint_window = |s: &mut Screen, last: isize| {
+            for r in 0..height {
+                let line_no = last - (height as isize - 1) + r as isize;
+                s.feed(format!("\x1b[{};1H", top + r as u16).as_bytes());
+                s.feed(b"\x1b[2K");
+                if line_no >= 1 {
+                    s.feed(format!("L{line_no}").as_bytes());
+                }
+            }
+        };
+        // Advancing stream: each new line does SU by 1 (evicting the region-top line
+        // into scrollback) then repaints the window. Eviction and repaint stay
+        // aligned, so no duplicate yet.
+        for i in 1..=k {
+            s.feed(b"\x1b[1S");
+            repaint_window(&mut s, i as isize);
+        }
+        // Over-scroll on the final frame: one more SU evicts the current viewport
+        // top (line k-height+1) into scrollback, but the app repaints the SAME
+        // window (content did not advance), so that very line reappears at the
+        // viewport top — exactly the scrollback/viewport seam duplicate Claude emits.
+        s.feed(b"\x1b[1S");
+        repaint_window(&mut s, k as isize);
+
+        let full = s.full_text();
+        let lines: Vec<&str> = full.lines().collect();
+        // Every streamed line is present, in order, and exactly once.
+        for i in 1..=k {
+            let label = format!("L{i}");
+            let count = lines.iter().filter(|l| **l == label).count();
+            assert_eq!(
+                count, 1,
+                "line {label} should appear exactly once: {full:?}"
+            );
+        }
+        let positions: Vec<usize> = (1..=k)
+            .map(|i| lines.iter().position(|l| **l == format!("L{i}")).unwrap())
+            .collect();
+        for w in positions.windows(2) {
+            assert!(w[0] < w[1], "lines out of order: {full:?}");
+        }
+        // No adjacent duplicate *content* line survived the seam (blank lines may
+        // legitimately repeat, e.g. region padding, so they are excluded).
+        for pair in lines.windows(2) {
+            if !pair[0].is_empty() {
+                assert_ne!(pair[0], pair[1], "adjacent duplicate at seam: {full:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn render_full_unchanged_without_overlap() {
+        // A plain CRLF stream of distinct lines longer than the viewport: the
+        // scrollback/viewport seam has no overlap, so full_text() must equal the
+        // naive `scrollback ++ viewport` join (every line retained, overlap 0).
+        let rows = 3usize;
+        let n = 12usize;
+        let mut s = Screen::new(rows as u16, 8);
+        let mut input = String::new();
+        for i in 0..n {
+            if i > 0 {
+                input.push_str("\r\n");
+            }
+            input.push_str(&format!("row{i}"));
+        }
+        s.feed(input.as_bytes());
+
+        // Build the naive join directly from the raw grid, with the same per-line
+        // trim and trailing-blank-drop, but WITHOUT seam reconciliation.
+        let render = |rows: &[Vec<char>]| -> Vec<String> {
+            rows.iter()
+                .map(|r| r.iter().collect::<String>().trim_end().to_string())
+                .collect()
+        };
+        let mut naive: Vec<String> = render(&s.primary.scrollback);
+        naive.extend(render(&s.primary.cells));
+        while naive.last().map(String::is_empty).unwrap_or(false) {
+            naive.pop();
+        }
+        assert_eq!(s.full_text(), naive.join("\n"));
+        // Sanity: all n distinct lines are present (no accidental over-merge).
+        assert_eq!(s.full_text().lines().count(), n);
+    }
+
+    #[test]
     fn claude_like_scroll_region_stream_is_fully_captured() {
         // Faithfully reproduce Claude Code's scrolling shape: it scrolls the
         // region with `CSI <n>S` (SU) and repaints each new line at the region's
@@ -848,6 +991,20 @@ mod tests {
         let begin_at = full.find("FCB_TST_BEGIN").unwrap();
         let end_at = full.find("FCB_TST_END").unwrap();
         assert!(begin_at < end_at, "sentinels out of order: {full:?}");
+
+        // The scrollback/viewport seam must not leave an adjacent duplicate: no two
+        // consecutive *content* transcript lines are identical (a SU-repaint
+        // boundary line stored in both scrollback and viewport would otherwise show
+        // up twice). Blank lines may legitimately repeat, so they are excluded.
+        let captured: Vec<&str> = full.lines().collect();
+        for pair in captured.windows(2) {
+            if !pair[0].is_empty() {
+                assert_ne!(
+                    pair[0], pair[1],
+                    "adjacent duplicate line at seam: {full:?}"
+                );
+            }
+        }
 
         // The viewport (text()) tracks the most-recent lines: the trailing
         // sentinel is visible and the leading one has scrolled off.
