@@ -275,6 +275,9 @@ pub(crate) fn looks_clean(s: &str) -> bool {
         "Tips for getting started",
         "esc to interrupt",
         "for agents",
+        // A leaked/corrupted sentinel fragment means the fence broke; fail the
+        // gate so we warn rather than print a half-marked reply.
+        "FCB_",
     ];
     if CHROME_SUBSTRINGS.iter().any(|m| s.contains(m)) {
         return false;
@@ -437,6 +440,12 @@ mod tests {
         ] {
             assert!(!looks_clean(m), "should reject banner: {m:?}");
         }
+    }
+
+    #[test]
+    fn looks_clean_rejects_leaked_marker() {
+        // A leaked/corrupted sentinel fragment must fail the gate.
+        assert!(!looks_clean("answer FCB_x_BEGIN more"));
     }
 
     #[test]

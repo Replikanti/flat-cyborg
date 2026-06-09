@@ -15,14 +15,16 @@
 //!
 //! This is intentionally a *partial* terminal emulator — enough to capture
 //! full-repaint and common cursor-addressed TUIs, not a complete VT
-//! implementation. It does **not** yet handle: scroll regions (DECSTBM),
-//! insert/delete line and character (IL/DL/ICH/DCH/ECH), repeat (REP), or
-//! autowrap mode (DECAWM). Wide / CJK / emoji characters are counted as a
-//! single cell, so absolute addressing can drift on screens that use them.
-//! Apps that fully repaint each frame (ratatui-style) render faithfully;
-//! incrementally-edited or scroll-region TUIs may show stale glyphs. These
-//! families can be added as needed; richer fidelity would warrant a
-//! purpose-built VT crate.
+//! implementation. It **does** handle scroll regions (DECSTBM) and scroll
+//! up/down (SU/SD), so a TUI that scrolls content inside a margin (e.g. Claude
+//! Code's alternate-screen view) evicts scrolled-off lines into the transcript
+//! correctly. It does **not** yet handle: insert/delete line and character
+//! (IL/DL/ICH/DCH/ECH), repeat (REP), or autowrap mode (DECAWM). Wide / CJK /
+//! emoji characters are counted as a single cell, so absolute addressing can
+//! drift on screens that use them. Apps that fully repaint each frame
+//! (ratatui-style) render faithfully; incrementally-edited TUIs may show stale
+//! glyphs. These families can be added as needed; richer fidelity would warrant
+//! a purpose-built VT crate.
 
 use crate::ansi::{Parser, Perform};
 
@@ -41,6 +43,11 @@ struct Grid {
     scrollback: Vec<Vec<char>>,
     row: usize,
     col: usize,
+    /// Top row of the scroll region (0-based, inclusive). Defaults to 0.
+    scroll_top: usize,
+    /// Bottom row of the scroll region (0-based, inclusive). Defaults to the
+    /// last physical row. Set together via DECSTBM (`CSI t;b r`).
+    scroll_bottom: usize,
     /// Saved cursor for DECSC/DECRC (`ESC[s` / `ESC[u`), per buffer — kept
     /// separate from the alternate-screen save so they cannot clobber each
     /// other.
@@ -56,6 +63,8 @@ impl Grid {
             scrollback: Vec::new(),
             row: 0,
             col: 0,
+            scroll_top: 0,
+            scroll_bottom: rows - 1,
             decsc: (0, 0),
         }
     }
@@ -69,6 +78,9 @@ impl Grid {
         self.scrollback.clear();
         self.row = 0;
         self.col = 0;
+        // Entering the alternate screen resets the scroll region to full-screen.
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows - 1;
     }
 
     fn put(&mut self, c: char) {
@@ -88,20 +100,65 @@ impl Grid {
     /// Moves the cursor down one row, scrolling if at the bottom. Returns
     /// `true` if a scroll occurred (a visible content change).
     fn line_feed(&mut self) -> bool {
-        if self.row + 1 >= self.rows {
-            // Scroll up: evict the top line into scrollback so the full
-            // transcript is retained, then append a blank bottom line.
-            let evicted = self.cells.remove(0);
+        if self.row == self.scroll_bottom {
+            self.scroll_region_up(1);
+            true
+        } else if self.row + 1 < self.rows {
+            self.row += 1;
+            false
+        } else {
+            false // below the scroll region at the physical bottom: clamp, no scroll
+        }
+    }
+
+    /// Scrolls the scroll region up by `n` lines: each line leaving the top of the
+    /// region is evicted into `scrollback` (so the transcript is retained), and a
+    /// blank line appears at the bottom of the region. Rows outside the region and
+    /// the grid length are unchanged.
+    fn scroll_region_up(&mut self, n: usize) {
+        let height = self.scroll_bottom - self.scroll_top + 1;
+        for _ in 0..n.min(height) {
+            let evicted = self.cells.remove(self.scroll_top);
             self.scrollback.push(evicted);
             if self.scrollback.len() > MAX_SCROLLBACK {
                 self.scrollback.remove(0);
             }
-            self.cells.push(vec![' '; self.cols]);
-            true
-        } else {
-            self.row += 1;
-            false
+            self.cells.insert(self.scroll_bottom, vec![' '; self.cols]);
         }
+    }
+
+    /// Scrolls the scroll region down by `n` lines: a blank line appears at the top
+    /// of the region and the bottom region line is discarded. No eviction (the
+    /// revealed lines are blank, not history).
+    fn scroll_region_down(&mut self, n: usize) {
+        let height = self.scroll_bottom - self.scroll_top + 1;
+        for _ in 0..n.min(height) {
+            self.cells.remove(self.scroll_bottom);
+            self.cells.insert(self.scroll_top, vec![' '; self.cols]);
+        }
+    }
+
+    /// DECSTBM (`CSI t;b r`): set the scroll region to rows `t..=b` (1-based input).
+    /// Missing/`0` params default to the full screen. An invalid range resets to the
+    /// full screen. Per the VT spec the cursor moves to the home position.
+    fn set_scroll_region(&mut self, params: &[u16]) {
+        let top = params.first().copied().unwrap_or(0);
+        let bottom = params.get(1).copied().unwrap_or(0);
+        let t = if top == 0 { 0 } else { (top - 1) as usize };
+        let b = if bottom == 0 {
+            self.rows - 1
+        } else {
+            (bottom - 1) as usize
+        };
+        if t < b && b < self.rows {
+            self.scroll_top = t;
+            self.scroll_bottom = b;
+        } else {
+            self.scroll_top = 0;
+            self.scroll_bottom = self.rows - 1;
+        }
+        self.row = 0;
+        self.col = 0;
     }
 
     fn carriage_return(&mut self) {
@@ -390,6 +447,10 @@ impl Perform for Screen {
             }
             b'J' => self.active().erase_display(p0),
             b'K' => self.active().erase_line(p0),
+            // DECSTBM and scroll up/down (SU/SD) — these change content.
+            b'r' => self.active().set_scroll_region(params),
+            b'S' => self.active().scroll_region_up(n),
+            b'T' => self.active().scroll_region_down(n),
             // SGR and anything else affect rendering only.
             _ => {}
         }
@@ -574,5 +635,230 @@ mod tests {
         assert!(!full.contains("n0\n"));
         // Bounded: at most cap scrollback lines plus the viewport rows.
         assert!(full.lines().count() <= MAX_SCROLLBACK + 2);
+    }
+
+    #[test]
+    fn decstbm_set_and_reset() {
+        // 4-row screen, region rows 2..4 (1-based) → rows 1..=3 (0-based).
+        let mut s = Screen::new(4, 6);
+        s.feed(b"\x1b[2;4r");
+        // Cursor homed by DECSTBM. Move to the region bottom (row 4, 1-based) and
+        // paint, then line-feed: a scroll happens *within* the region, so the
+        // fixed top row (row 1) is untouched.
+        s.feed(b"\x1b[1;1Htop");
+        s.feed(b"\x1b[4;1Hbot");
+        // Line-feed at the region bottom scrolls the region up and evicts.
+        assert!(s.feed(b"\n"));
+        // The top margin row is still intact.
+        assert!(
+            s.text().starts_with("top"),
+            "top margin lost: {:?}",
+            s.text()
+        );
+        // "bot" scrolled up within the region.
+        assert!(s.full_text().contains("bot"));
+
+        // Reset to full screen and confirm scrolling now happens at the physical
+        // bottom (the top row is evicted, not preserved).
+        s.feed(b"\x1b[r");
+        let mut s2 = Screen::new(2, 4);
+        s2.feed(b"\x1b[r"); // reset on a fresh full-screen grid is a no-op
+        s2.feed(b"aaaa\r\nbbbb\r\ncccc");
+        // Same behaviour as the default full-screen region.
+        assert_eq!(s2.text(), "bbbb\ncccc");
+        assert_eq!(s2.full_text(), "aaaa\nbbbb\ncccc");
+    }
+
+    #[test]
+    fn line_feed_scrolls_within_region_preserving_top_and_bottom_margins() {
+        // 6-row screen. Region rows 2..4 (1-based) → rows 1..=3 (0-based). Row 1
+        // (top margin) and row 6 (bottom margin) must stay fixed.
+        let mut s = Screen::new(6, 6);
+        s.feed(b"\x1b[2;4r");
+        s.feed(b"\x1b[1;1HTOP"); // fixed top margin (above region)
+        s.feed(b"\x1b[6;1HBOT"); // fixed bottom margin (below region)
+                                 // Fill the region (rows 2,3,4) and scroll past its bottom.
+        s.feed(b"\x1b[2;1Hr1\r\nr2\r\nr3\r\nr4\r\nr5");
+        let text = s.text();
+        // Margins survive untouched.
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.first().copied(), Some("TOP"), "text: {text:?}");
+        // BOT is the last non-blank line of the screen (row 6, 0-based 5).
+        assert_eq!(lines.get(5).copied(), Some("BOT"), "text: {text:?}");
+        // The region scrolled: the latest content (r5) is visible, the earliest
+        // (r1) scrolled out of the viewport but is retained in the transcript.
+        assert!(text.contains("r5"), "region did not advance: {text:?}");
+        assert!(!text.contains("r1"), "stale region line remained: {text:?}");
+        assert!(
+            s.full_text().contains("r1"),
+            "region top not evicted to scrollback"
+        );
+    }
+
+    #[test]
+    fn scroll_region_up_evicts_top_line_into_scrollback() {
+        // 4-row screen, small region rows 1..2 (1-based) → 0..=1.
+        let mut s = Screen::new(4, 6);
+        s.feed(b"\x1b[1;2r");
+        s.feed(b"\x1b[1;1H");
+        // Feed enough lines that region-top lines are evicted.
+        s.feed(b"L0\r\nL1\r\nL2\r\nL3\r\nL4");
+        // Viewport (region rows) shows only the recent two lines.
+        let text = s.text();
+        assert!(
+            text.contains("L3"),
+            "viewport missing recent line: {text:?}"
+        );
+        assert!(
+            text.contains("L4"),
+            "viewport missing recent line: {text:?}"
+        );
+        assert!(!text.contains("L0"), "old line still in viewport: {text:?}");
+        // Full transcript retains every line in order.
+        let full = s.full_text();
+        let positions: Vec<Option<usize>> = (0..=4).map(|i| full.find(&format!("L{i}"))).collect();
+        assert!(
+            positions.iter().all(Option::is_some),
+            "missing line: {full:?}"
+        );
+        for w in positions.windows(2) {
+            assert!(w[0].unwrap() < w[1].unwrap(), "out of order: {full:?}");
+        }
+    }
+
+    #[test]
+    fn su_scrolls_region_up_and_evicts() {
+        // Region rows 1..3 (1-based) → 0..=2 on a 4-row screen.
+        let mut s = Screen::new(4, 6);
+        s.feed(b"\x1b[1;3r");
+        s.feed(b"\x1b[1;1Haaa");
+        s.feed(b"\x1b[2;1Hbbb");
+        s.feed(b"\x1b[3;1Hccc");
+        // Explicit SU by 2: top two region lines evicted, blanks at region bottom.
+        s.feed(b"\x1b[2S");
+        // "ccc" rose to the region top; "aaa"/"bbb" evicted to scrollback.
+        let text = s.text();
+        assert!(text.starts_with("ccc"), "SU did not shift region: {text:?}");
+        assert!(
+            !text.contains("aaa"),
+            "evicted line still visible: {text:?}"
+        );
+        let full = s.full_text();
+        assert!(
+            full.contains("aaa") && full.contains("bbb"),
+            "eviction lost: {full:?}"
+        );
+        // A blank now sits at the region bottom (row 3, 0-based 2).
+        let lines: Vec<&str> = text.lines().collect();
+        assert_ne!(lines.get(2).copied(), Some("ccc"));
+    }
+
+    #[test]
+    fn sd_scrolls_region_down_without_eviction() {
+        // Region rows 1..3 (1-based) → 0..=2 on a 4-row screen.
+        let mut s = Screen::new(4, 6);
+        s.feed(b"\x1b[1;3r");
+        s.feed(b"\x1b[1;1Haaa");
+        s.feed(b"\x1b[2;1Hbbb");
+        s.feed(b"\x1b[3;1Hccc");
+        // Nothing has scrolled yet, so there is no scrollback.
+        assert!(s.primary.scrollback.is_empty());
+        // Explicit SD by 1: blank at region top, bottom region line (ccc) dropped.
+        s.feed(b"\x1b[1T");
+        let text = s.text();
+        let lines: Vec<&str> = text.lines().collect();
+        // Region top is now blank (so the first visible line is the old "aaa",
+        // pushed down one row).
+        assert_eq!(
+            lines.first().copied(),
+            Some(""),
+            "no blank at region top: {text:?}"
+        );
+        assert_eq!(
+            lines.get(1).copied(),
+            Some("aaa"),
+            "aaa not pushed down: {text:?}"
+        );
+        assert_eq!(
+            lines.get(2).copied(),
+            Some("bbb"),
+            "bbb not pushed down: {text:?}"
+        );
+        // The bottom region line "ccc" was discarded entirely.
+        assert!(
+            !s.full_text().contains("ccc"),
+            "ccc should be discarded: {:?}",
+            s.full_text()
+        );
+        // SD does not evict, so the scrollback (transcript history) is unchanged —
+        // still empty. The revealed top line is blank, not retained history.
+        assert!(
+            s.primary.scrollback.is_empty(),
+            "SD must not evict into scrollback"
+        );
+    }
+
+    #[test]
+    fn claude_like_scroll_region_stream_is_fully_captured() {
+        // Faithfully reproduce Claude Code's scrolling shape: it scrolls the
+        // region with `CSI <n>S` (SU) and repaints each new line at the region's
+        // bottom row with absolute addressing — it does NOT line-feed (`\n`) the
+        // content through. The pre-fix emulator ignored `CSI S`, so every repaint
+        // overwrote the same row and the earlier lines (and the BEGIN sentinel)
+        // were lost; this test therefore FAILS on the old code path and is a true
+        // regression guard, not just a `full_text()` tautology.
+        let rows: u16 = 6;
+        let mut s = Screen::new(rows, 16);
+        s.feed(b"\x1b[?1049h\x1b[2J\x1b[H");
+        // Region rows 2..5 (1-based) → 0-based 1..=4, height 4 (< stream length).
+        s.feed(b"\x1b[2;5r");
+
+        // Painted lines, in order: a leading sentinel, K numbers, a trailing
+        // sentinel — each delivered the way Claude does it (SU, then paint at the
+        // region's bottom row), never via `\n`.
+        let k = 20;
+        let mut painted: Vec<String> = Vec::with_capacity(k + 2);
+        painted.push("FCB_TST_BEGIN".to_string());
+        painted.extend((1..=k).map(|i| i.to_string()));
+        painted.push("FCB_TST_END".to_string());
+        for line in &painted {
+            s.feed(b"\x1b[1S"); // SU: evict the region-top line into scrollback
+            s.feed(b"\x1b[5;1H"); // cursor to the region bottom (1-based row 5)
+            s.feed(line.as_bytes());
+        }
+
+        // full_text() = scrollback + viewport must reconstruct the whole stream.
+        let full = s.full_text();
+        assert!(
+            full.contains("FCB_TST_BEGIN"),
+            "BEGIN sentinel lost: {full:?}"
+        );
+        assert!(full.contains("FCB_TST_END"), "END sentinel lost: {full:?}");
+        // Every number 1..=K present and in order, with the sentinels bracketing.
+        let mut cursor = full.find("FCB_TST_BEGIN").unwrap();
+        for i in 1..=k {
+            let needle = format!("\n{i}\n");
+            // Search a padded copy so first/last numbers match the \n…\n shape.
+            let padded = format!("\n{full}\n");
+            let pos = padded[cursor..]
+                .find(&needle)
+                .unwrap_or_else(|| panic!("missing line {i} in order: {full:?}"));
+            cursor += pos + 1;
+        }
+        let begin_at = full.find("FCB_TST_BEGIN").unwrap();
+        let end_at = full.find("FCB_TST_END").unwrap();
+        assert!(begin_at < end_at, "sentinels out of order: {full:?}");
+
+        // The viewport (text()) tracks the most-recent lines: the trailing
+        // sentinel is visible and the leading one has scrolled off.
+        let view = s.text();
+        assert!(
+            view.contains("FCB_TST_END"),
+            "END not in viewport: {view:?}"
+        );
+        assert!(
+            !view.contains("FCB_TST_BEGIN"),
+            "BEGIN should have scrolled off the viewport: {view:?}"
+        );
     }
 }
