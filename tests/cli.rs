@@ -175,6 +175,52 @@ fn no_extract_output_unchanged() {
 }
 
 #[test]
+fn no_jitter_types_a_large_command_in_one_burst() {
+    // --no-jitter is the make-or-break path for programmatic drivers: a large
+    // --cmd must be typed at once, not char-by-char over minutes. Drive an
+    // interactive shell, echo a long string, and assert the round-trip both
+    // produces the output and finishes well under the per-char-jitter time
+    // (3000 chars at ~40-300 ms each would be minutes; the watchdog ceiling
+    // here is generous but the burst must beat it comfortably).
+    use std::time::Instant;
+    let payload = "z".repeat(3000);
+    let cmd = format!("printf 'LEN=%s\\n' \"$(printf %s '{payload}' | wc -c)\"");
+    let start = Instant::now();
+    let out = Command::new(bin())
+        .args([
+            "--no-jitter",
+            "--idle-ms",
+            "400",
+            "--timeout-ms",
+            "20000",
+            "--prompt",
+            "READY> ",
+            "--cmd",
+            &cmd,
+            "--",
+            "sh",
+            "-c",
+            "PS1='READY> '; export PS1; exec sh -i",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run with --no-jitter");
+    let elapsed = start.elapsed();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("LEN=3000"),
+        "the 3000-char command was not typed/executed; stdout: {stdout:?}"
+    );
+    // Per-char jitter on 3000 chars would be on the order of minutes; the burst
+    // path must be far faster. 15s is a wide CI-safe margin that the jittered
+    // path could never meet.
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "--no-jitter typing was not a single burst, took {elapsed:?}"
+    );
+}
+
+#[test]
 fn extract_without_markers_warns_and_prints_nothing() {
     // The per-run markers are random, so a static target cannot reproduce them.
     // When the markers are absent from the output, --extract prints nothing to
