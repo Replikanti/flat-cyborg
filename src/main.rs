@@ -61,6 +61,12 @@ OPTIONS:
                         known CLIs (claude, codex) falls back to structural
                         screen extraction if the model omits the markers. Never
                         prints UI chrome (needs --cmd).
+    --no-jitter         Write each --cmd as a single burst with no per-keystroke
+                        human-cadence delay. The default jitter types one char
+                        at a time (40-300 ms each), which is minutes for a
+                        multi-thousand-char prompt; --no-jitter makes a large
+                        prompt land in one write. Use for programmatic drivers
+                        where the anti-anomaly cadence is not wanted.
     -h, --help          Print this help.
 
 COMMANDS:
@@ -153,6 +159,7 @@ fn parse_args() -> Result<Mode, String> {
             "--cwd" => cwd = Some(take_value("--cwd")?),
             "--tui" => config.tui = true,
             "--extract" => extract = true,
+            "--no-jitter" => config.burst_input = true,
             other => return Err(format!("unknown option: {other}")),
         }
         i += 1;

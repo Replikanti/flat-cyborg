@@ -21,6 +21,7 @@
 //! raw mode to restore. The interactive demo front-end, which does put the host
 //! TTY in raw mode, owns that cleanup via an RAII guard.
 
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ansi::{is_approval_menu, is_confirmation_prompt, line_ends_with_any, Sanitizer};
@@ -56,6 +57,16 @@ pub struct WrapperConfig {
     /// a settled screen (quiet for `idle_silence`) as IDLE, rather than looking
     /// for a line-oriented trailing prompt.
     pub tui: bool,
+    /// Single-burst input (the `--no-jitter` flag): instead of one jittered
+    /// keystroke per character (40-300 ms each — minutes for a
+    /// multi-thousand-char prompt), write the command body in fast fixed-size
+    /// chunks, let the screen settle, then send the `\r` submit as a *separate*
+    /// write. Two things make this work against an Ink-style TUI (e.g. claude):
+    /// chunking the body defeats the editor's "many chars at once = collapse to
+    /// a [Pasted text] placeholder" heuristic, and the settled, separate Enter
+    /// is registered as a real submit rather than being swallowed as part of a
+    /// paste. Off by default (human-cadence jitter is the default).
+    pub burst_input: bool,
 }
 
 impl Default for WrapperConfig {
@@ -72,6 +83,7 @@ impl Default for WrapperConfig {
             auto_confirm: true,
             auto_approve: false,
             tui: false,
+            burst_input: false,
         }
     }
 }
@@ -185,15 +197,71 @@ impl Wrapper {
         self.wait_until_idle()
     }
 
-    /// Types `command` into the target with human-like jitter, terminated by a
-    /// carriage return.
+    /// Types `command` into the target, terminated by a carriage return.
+    ///
+    /// Uses human-like per-keystroke jitter by default, or a fast single-burst
+    /// path when [`WrapperConfig::burst_input`] is set (see [`Self::send_burst`]).
     ///
     /// # Errors
     /// Returns an error if writing to the master fails.
     pub fn send(&mut self, command: &str) -> Result<()> {
+        if self.config.burst_input {
+            return self.send_burst(command);
+        }
         let session = &self.session;
         self.jitter
             .type_command(command, |bytes| session.write_input(bytes))
+    }
+
+    /// Fast input path for [`WrapperConfig::burst_input`]: write the command
+    /// body in fixed-size chunks (no per-char jitter), let the screen settle,
+    /// then send the `\r` submit as a *separate* write.
+    ///
+    /// Rationale (vs. flooding the whole command + `\r` in one write):
+    /// - **Chunking the body** keeps each write small enough that an
+    ///   Ink-style editor (claude) accumulates it as typed text instead of
+    ///   collapsing a large single write to a `[Pasted text]` placeholder.
+    /// - **A settled, separate Enter** is registered as a deliberate submit; a
+    ///   `\r` glued to the tail of a big burst is otherwise swallowed by the
+    ///   editor's paste handling and the prompt is never sent.
+    ///
+    /// Newlines inside `command` are written as `\r` (matching the jitter
+    /// terminator convention) so an editor that submits on Enter does not fire
+    /// early on an embedded `\n`; the final submit is a lone `\r` after the
+    /// body has rendered.
+    ///
+    /// # Errors
+    /// Returns an error if writing to the master fails.
+    pub fn send_burst(&mut self, command: &str) -> Result<()> {
+        /// Bytes per body chunk. Small enough to stay under an editor's
+        /// fast-input "paste" heuristic, large enough that even a multi-KB
+        /// prompt is a handful of writes (delivered in well under a second).
+        const CHUNK: usize = 64;
+        /// Pause between body chunks: lets the editor's render keep up so the
+        /// stream reads as fast typing, not a single pasted block.
+        const CHUNK_GAP: Duration = Duration::from_millis(8);
+        /// Settle before the submit Enter so the fully-rendered input field
+        /// has left any paste-buffering state and accepts the `\r` as submit.
+        const SUBMIT_SETTLE: Duration = Duration::from_millis(250);
+
+        // Translate embedded newlines to `\r` so the body matches what the
+        // jitter path emits and an Enter-submits editor does not fire early.
+        let body: Vec<u8> = command
+            .bytes()
+            .map(|b| if b == b'\n' { b'\r' } else { b })
+            .collect();
+        let mut offset = 0;
+        while offset < body.len() {
+            let end = (offset + CHUNK).min(body.len());
+            self.session.write_input(&body[offset..end])?;
+            offset = end;
+            if offset < body.len() {
+                thread::sleep(CHUNK_GAP);
+            }
+        }
+        // Let the input field render and settle, then submit with a lone `\r`.
+        thread::sleep(SUBMIT_SETTLE);
+        self.session.write_input(b"\r")
     }
 
     /// Drives the lifecycle state machine until the target is IDLE, has exited,
@@ -527,6 +595,85 @@ mod tests {
             w.clean_log().contains("abc123"),
             "command output missing; log: {:?}",
             w.clean_log()
+        );
+    }
+
+    #[test]
+    fn burst_input_sends_a_large_command_in_one_burst() {
+        // `--no-jitter` path: a multi-thousand-char command must be delivered
+        // as a fast chunked burst (not minutes of per-char jitter) and still
+        // execute. Drive an interactive shell and echo a long string back.
+        let config = WrapperConfig {
+            idle_silence: Duration::from_millis(250),
+            exec_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(50),
+            prompt_tokens: vec!["READY> ".to_string()],
+            burst_input: true,
+            ..WrapperConfig::default()
+        };
+        let mut w = wrapper(
+            "sh",
+            &["-c", "PS1='READY> '; export PS1; exec sh -i"],
+            config,
+        );
+
+        let first = w.wait_until_idle().expect("first idle");
+        assert_eq!(first, Outcome::Idle);
+
+        let payload = "q".repeat(3000);
+        let cmd = format!("printf 'LEN=%s\\n' \"$(printf %s '{payload}' | wc -c)\"");
+        let start = Instant::now();
+        let outcome = w.run_command(&cmd).expect("run");
+        assert_eq!(outcome, Outcome::Idle);
+        assert!(
+            w.clean_log().contains("LEN=3000"),
+            "burst command did not execute; log: {:?}",
+            w.clean_log()
+        );
+        // The burst is a handful of 64-byte writes + one settle; nowhere near
+        // the minutes per-char jitter would take on 3000 chars.
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "burst input was not fast, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn burst_input_translates_embedded_newlines_to_carriage_returns() {
+        // The body's `\n` are rewritten to `\r` so a shell runs each line as a
+        // separate statement (and an Enter-submits editor does not fire early).
+        // Two newline-separated statements must both execute.
+        let config = WrapperConfig {
+            idle_silence: Duration::from_millis(250),
+            exec_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(50),
+            prompt_tokens: vec!["READY> ".to_string()],
+            burst_input: true,
+            ..WrapperConfig::default()
+        };
+        let mut w = wrapper(
+            "sh",
+            &["-c", "PS1='READY> '; export PS1; exec sh -i"],
+            config,
+        );
+
+        let first = w.wait_until_idle().expect("first idle");
+        assert_eq!(first, Outcome::Idle);
+
+        // `send` (burst) rewrites the embedded newline; the trailing submit is a
+        // lone `\r`, so the second statement runs too.
+        w.send("echo first\necho second").expect("send");
+        let outcome = w.wait_until_idle().expect("wait");
+        assert_eq!(outcome, Outcome::Idle);
+        let log = w.clean_log();
+        assert!(
+            log.contains("first"),
+            "first statement missing; log: {log:?}"
+        );
+        assert!(
+            log.contains("second"),
+            "second statement missing; log: {log:?}"
         );
     }
 }
