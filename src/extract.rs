@@ -324,15 +324,34 @@ pub(crate) fn choose_reply(
     None
 }
 
-/// Extracts the text between the LAST begin/end marker pair in `text`. Using the
-/// last pair skips the echoed instruction (which appears earlier in the
-/// transcript) and grabs the model's actual fenced reply. Returns `None` if
-/// either marker is missing.
+/// Extracts the text between the LAST real begin/end fence in `text`. A real
+/// fence puts each marker alone on its line, so the marker is followed (after
+/// optional trailing spaces/tabs) by a newline or end-of-text. Requiring that
+/// rejects an *echoed-instruction* mention, where prose follows the marker on
+/// the same line (e.g. "the marker FCB_x_BEGIN on its own line before it …") —
+/// otherwise a non-compliant target's echo could form a false fence that `rfind`
+/// returns as the reply (#40). Returns `None` if no real fence is present.
 fn extract_between(text: &str, begin: &str, end: &str) -> Option<String> {
-    let e = text.rfind(end)?; // last END
-    let b = text[..e].rfind(begin)?; // last BEGIN before it
+    let e = last_marker_at_line_end(text, end, text.len())?; // last real END
+    let b = last_marker_at_line_end(text, begin, e)?; // last real BEGIN before it
     let inner = &text[b + begin.len()..e];
     Some(inner.trim().to_string())
+}
+
+/// Byte offset of the last occurrence of `marker` within `text[..limit]` that
+/// sits at the end of its line — i.e. only spaces/tabs separate it from the next
+/// `\n`/`\r` or the end of `text`. Walks occurrences backward so an earlier real
+/// fence is found even when a later occurrence is mid-line prose. `None` if none.
+fn last_marker_at_line_end(text: &str, marker: &str, limit: usize) -> Option<usize> {
+    let mut search_end = limit;
+    while let Some(pos) = text[..search_end].rfind(marker) {
+        let after = text[pos + marker.len()..].trim_start_matches([' ', '\t']);
+        if after.is_empty() || after.starts_with('\n') || after.starts_with('\r') {
+            return Some(pos);
+        }
+        search_end = pos; // this occurrence is mid-line; keep looking earlier
+    }
+    None
 }
 
 #[cfg(test)]
@@ -499,6 +518,47 @@ mod tests {
     #[test]
     fn extract_between_missing_markers_is_none() {
         assert_eq!(extract_between("no markers here", "B", "E"), None);
+    }
+
+    #[test]
+    fn extract_between_rejects_echoed_instruction_then_takes_real_fence() {
+        // #40: a non-compliant target echoes the wrap instruction AFTER the
+        // reply, so the echoed (mid-line, prose-after) markers are the LAST
+        // occurrences. The line-end rule must skip them and return the real
+        // fenced reply, not the echoed prose.
+        let begin = "FCB_w_BEGIN";
+        let end = "FCB_w_END";
+        let transcript = format!(
+            "{begin}\nThe real answer.\n{end}\n\
+             reminder: wrap between {begin} on its own line and {end} after it."
+        );
+        assert_eq!(
+            extract_between(&transcript, begin, end).as_deref(),
+            Some("The real answer.")
+        );
+    }
+
+    #[test]
+    fn extract_between_rejects_markers_with_trailing_prose_only() {
+        // Only echoed-instruction mentions (markers always followed by prose on
+        // the same line) → no real fence → None.
+        let begin = "FCB_q_BEGIN";
+        let end = "FCB_q_END";
+        let transcript =
+            format!("Sure — put {begin} before your answer and {end} after the last line.");
+        assert_eq!(extract_between(&transcript, begin, end), None);
+    }
+
+    #[test]
+    fn extract_between_accepts_marker_with_trailing_spaces_before_newline() {
+        // A real fence may have trailing spaces after the marker (terminal pad).
+        let begin = "FCB_s_BEGIN";
+        let end = "FCB_s_END";
+        let transcript = format!("{begin}  \nanswer\n{end}   \n");
+        assert_eq!(
+            extract_between(&transcript, begin, end).as_deref(),
+            Some("answer")
+        );
     }
 
     #[test]
