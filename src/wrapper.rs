@@ -67,6 +67,27 @@ pub struct WrapperConfig {
     /// is registered as a real submit rather than being swallowed as part of a
     /// paste. Off by default (human-cadence jitter is the default).
     pub burst_input: bool,
+    /// Soft-fold each logical input line to at most this many columns at word
+    /// boundaries before delivery (the `--wrap-input <COLS>` flag); `0` (the
+    /// default) leaves the input untouched.
+    ///
+    /// An ultra-long *single* logical line overflows an Ink-style editor's
+    /// input field so the prompt is never delivered whole; breaking it into
+    /// shorter lines (which the model reads identically) makes delivery
+    /// reliable. Only applied in the burst path ([`Self::burst_input`]): the
+    /// fold introduces newlines, and only the burst path translates them to the
+    /// `\r` an Enter-submits editor needs without firing early.
+    pub wrap_input: usize,
+    /// Optional transcript needle that gates IDLE: while set, [`Output::Idle`]
+    /// silence is ignored until a line equal to this string (trimmed) has
+    /// appeared in the transcript. `None` (the default) disables the gate.
+    ///
+    /// Used by `--extract` to hold off completion until the model's closing
+    /// sentinel marker has been emitted — a model that emits startup chrome and
+    /// then pauses to think must not have that pause mistaken for a finished
+    /// (empty) reply. The watchdog (`exec_timeout`) remains the backstop if the
+    /// needle never appears.
+    pub idle_gate: Option<String>,
 }
 
 impl Default for WrapperConfig {
@@ -84,6 +105,8 @@ impl Default for WrapperConfig {
             auto_approve: false,
             tui: false,
             burst_input: false,
+            wrap_input: 0,
+            idle_gate: None,
         }
     }
 }
@@ -174,6 +197,24 @@ impl Wrapper {
             .unwrap_or_default()
     }
 
+    /// Whether the IDLE gate ([`WrapperConfig::idle_gate`]) is satisfied: `true`
+    /// when no gate is configured, or when the gate needle has appeared as its
+    /// own (trimmed) line in the transcript. The transcript is the screen's full
+    /// text in TUI mode and the sanitized line log otherwise.
+    fn idle_gate_open(&self) -> bool {
+        match &self.config.idle_gate {
+            None => true,
+            Some(needle) => {
+                let hay = if self.config.tui {
+                    self.screen_full_text()
+                } else {
+                    self.sanitizer.clean_log()
+                };
+                transcript_has_line(&hay, needle)
+            }
+        }
+    }
+
     /// Mutable access to the underlying session.
     pub fn session(&mut self) -> &mut PtySession {
         &mut self.session
@@ -243,6 +284,20 @@ impl Wrapper {
         /// Settle before the submit Enter so the fully-rendered input field
         /// has left any paste-buffering state and accepts the `\r` as submit.
         const SUBMIT_SETTLE: Duration = Duration::from_millis(250);
+
+        // Soft-fold long single lines first: an ultra-long *single* logical line
+        // overflows the editor's input field so the prompt is never delivered
+        // whole. Breaking it at word boundaries (the model reads the wrapped text
+        // identically) makes delivery reliable. The folded newlines become `\r`
+        // below, which the burst path delivers as in-line newlines — only the
+        // settled trailing `\r` submits.
+        let folded;
+        let command: &str = if self.config.wrap_input > 0 {
+            folded = fold_text(command, self.config.wrap_input);
+            &folded
+        } else {
+            command
+        };
 
         // Translate embedded newlines to `\r` so the body matches what the
         // jitter path emits and an Enter-submits editor does not fire early.
@@ -395,7 +450,10 @@ impl Wrapper {
                                 .collect();
                             line_ends_with_any(&self.sanitizer.current_line(), &tokens)
                         };
-                        if idle {
+                        // The sentinel-aware gate (when set) holds off IDLE until
+                        // the model has actually emitted its closing marker, so a
+                        // mid-think pause is not mistaken for a finished reply.
+                        if idle && self.idle_gate_open() {
                             self.state = State::Idle;
                             return Ok(Outcome::Idle);
                         }
@@ -411,6 +469,56 @@ impl Wrapper {
             }
         }
     }
+}
+
+/// True if any line of `hay`, trimmed, equals `needle`. The gate matches a
+/// standalone line (not a substring) so the marker named *inside* the echoed
+/// wrap instruction — where it sits mid-sentence — does not satisfy the gate;
+/// only the model emitting the marker on its own line does.
+pub(crate) fn transcript_has_line(hay: &str, needle: &str) -> bool {
+    let needle = needle.trim();
+    hay.lines().any(|l| l.trim() == needle)
+}
+
+/// Soft-folds `text` so no line exceeds `width` columns, breaking at the last
+/// blank within the width window where possible (like `fold -s`) and
+/// hard-splitting a word longer than `width`. Existing newlines are preserved;
+/// `width == 0` returns the text unchanged. Width is counted in `char`s.
+pub(crate) fn fold_text(text: &str, width: usize) -> String {
+    if width == 0 {
+        return text.to_string();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        fold_line(line, width, &mut out);
+    }
+    out.join("\n")
+}
+
+/// Folds a single newline-free `line` into one or more segments of at most
+/// `width` columns, appending each to `out`.
+fn fold_line(line: &str, width: usize, out: &mut Vec<String>) {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= width {
+        out.push(line.to_string());
+        return;
+    }
+    let mut start = 0;
+    while chars.len() - start > width {
+        let window_end = start + width;
+        // Prefer to break after the last blank inside the window; the blank
+        // stays on the current segment, matching `fold -s`.
+        let brk = (start + 1..window_end)
+            .rev()
+            .find(|&i| chars[i] == ' ' || chars[i] == '\t');
+        let cut = match brk {
+            Some(i) => i + 1,
+            None => window_end, // no blank to break on: hard-split at the width
+        };
+        out.push(chars[start..cut].iter().collect());
+        start = cut;
+    }
+    out.push(chars[start..].iter().collect());
 }
 
 #[cfg(test)]
@@ -675,5 +783,101 @@ mod tests {
             log.contains("second"),
             "second statement missing; log: {log:?}"
         );
+    }
+
+    #[test]
+    fn wrap_input_leaves_a_short_command_intact() {
+        // With `--wrap-input` set, a command already under the width is delivered
+        // unchanged (no spurious folding) and still executes.
+        let config = WrapperConfig {
+            idle_silence: Duration::from_millis(250),
+            exec_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(50),
+            prompt_tokens: vec!["READY> ".to_string()],
+            burst_input: true,
+            wrap_input: 72,
+            ..WrapperConfig::default()
+        };
+        let mut w = wrapper(
+            "sh",
+            &["-c", "PS1='READY> '; export PS1; exec sh -i"],
+            config,
+        );
+        let first = w.wait_until_idle().expect("first idle");
+        assert_eq!(first, Outcome::Idle);
+
+        w.send("echo hello_wrap").expect("send");
+        let outcome = w.wait_until_idle().expect("wait");
+        assert_eq!(outcome, Outcome::Idle);
+        assert!(
+            w.clean_log().contains("hello_wrap"),
+            "wrapped short command did not run; log: {:?}",
+            w.clean_log()
+        );
+    }
+
+    #[test]
+    fn fold_text_zero_width_is_identity() {
+        let s = "a very long line that should not be touched at all in this case";
+        assert_eq!(fold_text(s, 0), s);
+    }
+
+    #[test]
+    fn fold_text_short_line_unchanged() {
+        assert_eq!(fold_text("short line", 72), "short line");
+    }
+
+    #[test]
+    fn fold_text_breaks_at_word_boundaries_and_preserves_words() {
+        let s = "the quick brown fox jumps over the lazy dog again and again now";
+        let folded = fold_text(s, 20);
+        for line in folded.lines() {
+            assert!(line.chars().count() <= 20, "line exceeds width: {line:?}");
+        }
+        // Folding only inserts newlines at blanks, so no word is broken.
+        assert_eq!(
+            s.split_whitespace().collect::<Vec<_>>(),
+            folded.split_whitespace().collect::<Vec<_>>(),
+            "words must be preserved: {folded:?}"
+        );
+    }
+
+    #[test]
+    fn fold_text_hard_splits_an_overlong_word() {
+        let s = "x".repeat(50);
+        let folded = fold_text(&s, 20);
+        for line in folded.lines() {
+            assert!(line.chars().count() <= 20, "line exceeds width: {line:?}");
+        }
+        // No characters are lost when a word is hard-split.
+        assert_eq!(folded.replace('\n', ""), s);
+    }
+
+    #[test]
+    fn fold_text_preserves_existing_newlines() {
+        let s = "first paragraph\n\nsecond paragraph fits";
+        assert_eq!(fold_text(s, 72), s);
+    }
+
+    #[test]
+    fn fold_text_counts_columns_in_chars_not_bytes() {
+        // Multibyte chars count as one column each.
+        let s = "ččččč ččččč ččččč";
+        let folded = fold_text(s, 11);
+        for line in folded.lines() {
+            assert!(line.chars().count() <= 11, "line exceeds width: {line:?}");
+        }
+    }
+
+    #[test]
+    fn idle_gate_matches_a_standalone_marker_line_only() {
+        let begin = "FCB_abc_BEGIN";
+        // The marker named mid-sentence in the echoed instruction must NOT open
+        // the gate (otherwise the gate is satisfied before the model replies).
+        let echo = "wrap your reply between FCB_abc_BEGIN and the closing marker.";
+        assert!(!transcript_has_line(echo, begin));
+        // The model emitting it on its own line — even indented — opens the gate.
+        let reply = "thinking…\n  FCB_abc_BEGIN\nthe answer line\n";
+        assert!(transcript_has_line(reply, begin));
     }
 }

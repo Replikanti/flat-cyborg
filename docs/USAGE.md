@@ -84,6 +84,8 @@ flat-cyborg picks a mode automatically:
 | `--auto-approve` | Auto-confirm agent **approval / trust menus** — the arrow-key numbered menus that agentic CLIs show for actions the `[y/n]` auto-confirm cannot answer (e.g. codex's `git push` confirmation, claude's "trust this folder" prompt) — by pressing Enter on the default "yes/proceed/trust" option. **Bypasses the agent's own safety gates (including for destructive actions), so it is opt-in and off by default.** |
 | `--extract` | The reply-extraction mechanism (see below): wraps each `--cmd` so the target fences its reply between unique per-run markers and prints only the fenced reply; for known CLIs (claude, codex) it falls back to structural screen extraction if the model omits the markers, and never prints UI chrome. Requires `--cmd`. |
 | `--tui` | Full-screen TUI mode (see below). |
+| `--no-jitter` | Write each `--cmd` as a fast chunked burst instead of one human-cadenced keystroke at a time (40-300 ms each — minutes for a multi-thousand-char prompt). Use for programmatic LLM drivers where the anti-anomaly typing cadence is not wanted. |
+| `--wrap-input <COLS>` | Soft-fold each input line to at most `COLS` columns at word boundaries before sending (default `0` = off). An ultra-long *single* line overflows an Ink-style editor's input field so the prompt is never delivered whole; folding it (the model reads the wrapped text identically) makes a large prompt land reliably. Pairs with `--no-jitter`. |
 | `-h`, `--help` | Print help. |
 
 ### `--tui` mode

@@ -69,6 +69,11 @@ OPTIONS:
                         multi-thousand-char prompt; --no-jitter makes a large
                         prompt land in one write. Use for programmatic drivers
                         where the anti-anomaly cadence is not wanted.
+    --wrap-input <COLS> Soft-fold each input line to <=COLS columns at word
+                        boundaries before sending (default 0 = off). An
+                        ultra-long single line overflows an Ink-style editor's
+                        input field; folding makes a large prompt land reliably.
+                        Pairs with --no-jitter (the burst path).
     -h, --help          Print this help.
 
 COMMANDS:
@@ -92,7 +97,7 @@ struct Args {
 enum Mode {
     Help,
     Version,
-    Run(Args),
+    Run(Box<Args>),
 }
 
 fn parse_args() -> Result<Mode, String> {
@@ -174,6 +179,13 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
                 config.tui = true;
             }
             "--no-jitter" => config.burst_input = true,
+            "--wrap-input" => {
+                let v = take_value("--wrap-input")?;
+                let cols: usize = v
+                    .parse()
+                    .map_err(|_| format!("invalid --wrap-input: {v}"))?;
+                config.wrap_input = cols;
+            }
             other => return Err(format!("unknown option: {other}")),
         }
         i += 1;
@@ -190,14 +202,14 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
         }
     }
 
-    Ok(Mode::Run(Args {
+    Ok(Mode::Run(Box::new(Args {
         cmds,
         config,
         extract,
         cwd,
         program: rest[0].clone(),
         program_args: rest[1..].to_vec(),
-    }))
+    })))
 }
 
 /// Builds a unique per-run ASCII sentinel pair. Plain `[A-Za-z0-9_]` so the
@@ -248,7 +260,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match run(args) {
+    match run(*args) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("flat-cyborg: {e}");
@@ -290,7 +302,15 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
     // are tried first when extracting. The pair is generated once so the same
     // markers are used for both wrapping and extraction.
     let sentinels = args.extract.then(sentinels);
-    let mut wrapper = Wrapper::with_config(session, args.config);
+    let mut config = args.config;
+    // In --extract, gate IDLE on the END marker appearing on its own line: the
+    // model may emit startup chrome and then pause to think before replying, and
+    // that pause must not be mistaken for a finished (empty) reply. The watchdog
+    // (--timeout-ms) remains the backstop if the markers never appear.
+    if let Some((_, end)) = &sentinels {
+        config.idle_gate = Some(end.clone());
+    }
+    let mut wrapper = Wrapper::with_config(session, config);
     let mut last = Outcome::Completed;
     for cmd in &args.cmds {
         // Wrapping (when used) is kept a CLI concern; the wrapper library stays
@@ -479,5 +499,36 @@ mod tests {
             }
             _ => panic!("expected Mode::Run"),
         }
+    }
+
+    #[test]
+    fn wrap_input_flag_sets_the_fold_width() {
+        let m = parse_from(vec![
+            "--wrap-input".into(),
+            "72".into(),
+            "--cmd".into(),
+            "hi".into(),
+            "--".into(),
+            "claude".into(),
+        ])
+        .expect("parse");
+        match m {
+            Mode::Run(a) => assert_eq!(a.config.wrap_input, 72),
+            _ => panic!("expected Mode::Run"),
+        }
+    }
+
+    #[test]
+    fn wrap_input_rejects_a_non_numeric_value() {
+        let err = match parse_from(vec![
+            "--wrap-input".into(),
+            "wide".into(),
+            "--".into(),
+            "claude".into(),
+        ]) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a parse error"),
+        };
+        assert!(err.contains("invalid --wrap-input"), "got: {err}");
     }
 }
