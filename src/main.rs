@@ -357,8 +357,9 @@ fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     let tui = args.config.tui;
     let program = args.program.clone();
     // --extract has nothing to wrap here (no --cmd selects orchestrator mode),
-    // so there are no sentinel markers in the output; extraction will fall back
-    // to structural for a known CLI, or warn.
+    // so there are no sentinel markers in the output; extraction therefore warns
+    // and prints nothing (strict default), or — with --extract-structural — tries
+    // a chrome-filtered structural scrape for a known CLI.
     let mut wrapper = Wrapper::with_config(session, args.config);
     let outcome = wrapper.wait_until_idle()?;
     print_capture(
@@ -397,9 +398,13 @@ fn print_capture(
         };
         match extract::choose_reply(program, &text, begin, end, allow_structural) {
             Some(s) => println!("{s}"),
-            // The target did not emit the markers. Print nothing (never chrome)
-            // and warn — a missing fence is empty downstream, not a structural
-            // scrape, unless --extract-structural opted into best-effort.
+            // The target did not emit the markers (and, under --extract-structural,
+            // no chrome-free slice was recoverable). Print nothing (never chrome)
+            // and warn. Suggest the opt-in only when it is not already on.
+            None if allow_structural => eprintln!(
+                "flat-cyborg: --extract found no fenced reply and no chrome-free \
+                 structural fallback; printing nothing."
+            ),
             None => eprintln!(
                 "flat-cyborg: --extract found no fenced reply (the target did not \
                  emit the markers); printing nothing. Pass --extract-structural \
