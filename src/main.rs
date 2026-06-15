@@ -244,9 +244,17 @@ fn sentinels() -> (String, String) {
 
 /// Appends the sentinel wrap instruction to a typed command, asking the target
 /// to fence its reply between the per-run markers.
+///
+/// Kept to a SINGLE line (no embedded `\n`): a newline-submitting TUI (codex)
+/// submits at the break, so a `{cmd}\n\n{instruction}` form would deliver the
+/// command and the instruction as two separate prompts — the model answers the
+/// command, never sees the wrap instruction, emits no fence, and only the
+/// echoed-instruction markers remain. One line → both arrive as one submission.
+/// (Claude treats an embedded newline as a soft break, so it was unaffected
+/// either way; this makes codex work too.)
 fn wrap_command(cmd: &str, begin: &str, end: &str) -> String {
     format!(
-        "{cmd}\n\nIMPORTANT: Output ONLY your answer, wrapped exactly between \
+        "{cmd}    IMPORTANT: Output ONLY your answer, wrapped exactly between \
          the marker {begin} on its own line before it and the marker {end} on \
          its own line after it. Do not include the markers anywhere else."
     )
@@ -503,9 +511,19 @@ mod tests {
     #[test]
     fn wrap_command_appends_markers() {
         let w = wrap_command("hello", "B_BEGIN", "B_END");
-        assert!(w.starts_with("hello\n\n"));
+        assert!(w.starts_with("hello"));
         assert!(w.contains("B_BEGIN"));
         assert!(w.contains("B_END"));
+    }
+
+    #[test]
+    fn wrap_command_is_single_line() {
+        // No embedded newline: a newline-submitting TUI (codex) must receive the
+        // command and the wrap instruction as ONE submission, else it never sees
+        // the instruction and emits no fence (#40).
+        let w = wrap_command("do a thing", "B_BEGIN", "B_END");
+        assert!(!w.contains('\n'), "wrap_command must be single-line: {w:?}");
+        assert!(w.contains("IMPORTANT"));
     }
 
     #[test]
