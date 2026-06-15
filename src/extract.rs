@@ -1,17 +1,19 @@
-//! Reply extraction for `--extract`: a sentinel-first hybrid.
+//! Reply extraction for `--extract`: sentinel-first, sentinel-strict by default.
 //!
-//! The primary path is the sentinel: the prompt is wrapped with unique per-run
-//! markers and [`extract_between`] slices the fenced reply out of the captured
-//! transcript. The markers are self-validating — if they are present we have
-//! high confidence in the result.
+//! The primary (and default) path is the sentinel: the prompt is wrapped with
+//! unique per-run markers and [`extract_between`] slices the fenced reply out of
+//! the captured transcript. The markers are self-validating — if they are
+//! present we have high confidence in the result; if they are absent the default
+//! is to return `None` (the caller prints nothing and warns), so a malformed or
+//! refusal reply is empty downstream rather than a guess.
 //!
-//! Only when a model omits the markers (e.g. some CLIs drop them on long
-//! replies) and the target is a known CLI do we fall back to *structural*
+//! Only when the caller opts in (`allow_structural`, the `--extract-structural`
+//! flag) and a known CLI omitted the markers do we fall back to *structural*
 //! extraction: slicing the answer out of the transcript by recognizing each
 //! tool's own chrome (prompt boxes, status lines, banners). That approach is
-//! tied to each CLI's TUI layout and inherently fragile to UI variation, so its
-//! result is accepted only if it passes the strict [`looks_clean`] gate; any
-//! whiff of chrome means we discard it and warn rather than print garbage.
+//! tied to each CLI's TUI layout and inherently fragile — even with the strict
+//! [`looks_clean`] gate it can pass echoed wrap-instruction prose on a refusal —
+//! so it is off by default and best-effort only.
 //!
 //! [`choose_reply`] implements that decision as a pure function so it is
 //! testable without a PTY. [`extract_for_target`] dispatches the structural
@@ -289,25 +291,37 @@ pub(crate) fn looks_clean(s: &str) -> bool {
     true
 }
 
-/// Decides the reply to emit, sentinel-first with a sanity-checked structural
-/// fallback. This is the pure core of the `--extract` decision so it can be
-/// tested without a PTY:
+/// Decides the reply to emit. This is the pure core of the `--extract` decision
+/// so it can be tested without a PTY:
 ///
 /// 1. If the sentinel markers are present, return the fenced text (high
-///    confidence — the markers are self-validating).
-/// 2. Otherwise, for a known CLI, try structural extraction and accept it ONLY
-///    if it passes [`looks_clean`].
+///    confidence — the markers are self-validating). This is the default,
+///    strict path.
+/// 2. Otherwise, **only when `allow_structural`** (the `--extract-structural`
+///    opt-in), try structural extraction for a known CLI and accept it ONLY if
+///    it passes [`looks_clean`].
 /// 3. Otherwise return `None` (the caller warns and prints nothing).
+///
+/// The structural slice is best-effort and tied to each CLI's chrome; on a
+/// refusal/clarification it can scrape echoed *wrap-instruction prose* (no
+/// chrome glyph, so [`looks_clean`] passes it) and hand a consumer garbage that
+/// is indistinguishable from a real reply. So it is gated behind an explicit
+/// opt-in; by default a missing fence is treated as no-reply (== empty
+/// downstream), never a structural scrape.
 pub(crate) fn choose_reply(
     program: &str,
     transcript: &str,
     begin: &str,
     end: &str,
+    allow_structural: bool,
 ) -> Option<String> {
     if let Some(fenced) = extract_between(transcript, begin, end) {
         return Some(fenced);
     }
-    extract_for_target(program, transcript).filter(|s| looks_clean(s))
+    if allow_structural {
+        return extract_for_target(program, transcript).filter(|s| looks_clean(s));
+    }
+    None
 }
 
 /// Extracts the text between the LAST begin/end marker pair in `text`. Using the
@@ -493,41 +507,68 @@ mod tests {
         assert_eq!(extract_between("reply text FCB_E", "FCB_B", "FCB_E"), None);
     }
 
-    // --- The hybrid decision (sentinel-first, sanity-checked structural). ---
+    // --- The decision: sentinel-first; structural only when opted in. ---
 
     #[test]
     fn choose_reply_prefers_sentinel_even_with_chrome_present() {
         let begin = "FCB_z_BEGIN";
         let end = "FCB_z_END";
         // The transcript has both fenced markers AND claude chrome elsewhere; the
-        // fenced text must win, untouched.
+        // fenced text must win, untouched — in BOTH modes.
         let transcript = format!(
             "● some chatter\n✻ Brewed for 1s\n{begin}\nThe real answer.\n{end}\n\
              ────────────\n❯\n  ⏵⏵ auto mode on"
         );
         assert_eq!(
-            choose_reply("claude", &transcript, begin, end).as_deref(),
+            choose_reply("claude", &transcript, begin, end, false).as_deref(),
+            Some("The real answer.")
+        );
+        assert_eq!(
+            choose_reply("claude", &transcript, begin, end, true).as_deref(),
             Some("The real answer.")
         );
     }
 
     #[test]
-    fn choose_reply_falls_back_to_clean_structural() {
-        // No markers, but the claude block is clean → structural fallback.
+    fn choose_reply_falls_back_to_clean_structural_only_when_opted_in() {
+        // No markers, but the claude block is clean → structural fallback ONLY
+        // with allow_structural=true.
         assert_eq!(
-            choose_reply("claude", CLAUDE_SHORT, "NOPE_BEGIN", "NOPE_END").as_deref(),
+            choose_reply("claude", CLAUDE_SHORT, "NOPE_BEGIN", "NOPE_END", true).as_deref(),
             Some("pineapple")
         );
     }
 
     #[test]
+    fn choose_reply_strict_default_ignores_even_a_clean_structural_slice() {
+        // The #42 fix: by default (allow_structural=false), a missing fence is
+        // no-reply, NOT a structural scrape — even when the slice would be clean.
+        assert_eq!(
+            choose_reply("claude", CLAUDE_SHORT, "NOPE_BEGIN", "NOPE_END", false),
+            None
+        );
+    }
+
+    #[test]
+    fn choose_reply_strict_default_ignores_echoed_instruction_prose() {
+        // The exact #42 repro: a refusal leaves only echoed wrap-instruction prose
+        // (no chrome glyph, so looks_clean passes it). Strict mode must return
+        // None rather than hand back that fragment.
+        let transcript = "● I can't help with that.\n  on its own line before it and the marker\n❯";
+        assert_eq!(
+            choose_reply("claude", transcript, "NOPE_BEGIN", "NOPE_END", false),
+            None
+        );
+    }
+
+    #[test]
     fn choose_reply_rejects_garbage_structural() {
-        // No markers and the "reply" the structural step could find is chrome —
-        // there is no `●` bullet so structural returns None anyway, and even a
+        // Even with structural opted in: no markers and the "reply" is chrome —
+        // there is no `●` bullet so structural returns None anyway, and a
         // chrome-laden block would be filtered by looks_clean. Either way: None.
         let transcript = "✻ Brewed for 1s\n────────────\n❯\n  ⏵⏵ auto mode on (shift+tab to cycle)";
         assert_eq!(
-            choose_reply("claude", transcript, "NOPE_BEGIN", "NOPE_END"),
+            choose_reply("claude", transcript, "NOPE_BEGIN", "NOPE_END", true),
             None
         );
     }
@@ -535,7 +576,7 @@ mod tests {
     #[test]
     fn choose_reply_unknown_target_without_markers_is_none() {
         assert_eq!(
-            choose_reply("bash", "just some output\n", "NOPE_BEGIN", "NOPE_END"),
+            choose_reply("bash", "just some output\n", "NOPE_BEGIN", "NOPE_END", true),
             None
         );
     }

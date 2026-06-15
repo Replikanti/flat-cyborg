@@ -57,12 +57,18 @@ OPTIONS:
                         rendered screen instead of the line log. A continuously
                         animated TUI may never settle — raise --idle-ms for it.
     --extract           Print only the model's reply. Wraps each --cmd prompt
-                        with unique markers and prints the fenced reply; for
-                        known CLIs (claude, codex) falls back to structural
-                        screen extraction if the model omits the markers. Never
-                        prints UI chrome (needs --cmd). Implies the 2D screen-grid
-                        capture (as --tui) since the reply is read from the
-                        rendered screen — required for alt-screen CLIs like claude.
+                        with unique markers and prints the fenced reply between
+                        them. Sentinel-STRICT by default: if the markers aren't
+                        found it prints nothing and warns (a malformed/refusal
+                        reply is empty downstream, never UI chrome). Needs --cmd.
+                        Implies the 2D screen-grid capture (as --tui) since the
+                        reply is read from the rendered screen — required for
+                        alt-screen CLIs like claude.
+    --extract-structural
+                        Opt-in (implies --extract): if the markers are absent,
+                        fall back to a best-effort, chrome-filtered structural
+                        scrape of a known CLI's screen. Off by default because
+                        the scrape can return echoed-prompt prose on a refusal.
     --no-jitter         Write each --cmd as a single burst with no per-keystroke
                         human-cadence delay. The default jitter types one char
                         at a time (40-300 ms each), which is minutes for a
@@ -88,6 +94,9 @@ struct Args {
     cmds: Vec<String>,
     config: WrapperConfig,
     extract: bool,
+    /// `--extract-structural`: allow the chrome-filtered structural fallback
+    /// when the sentinel markers are absent. Off by default (sentinel-strict).
+    extract_structural: bool,
     cwd: Option<String>,
     program: String,
     program_args: Vec<String>,
@@ -139,6 +148,7 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
     let mut config = WrapperConfig::default();
     let mut prompts: Vec<String> = Vec::new();
     let mut extract = false;
+    let mut extract_structural = false;
     let mut cwd: Option<String> = None;
 
     let mut i = 0;
@@ -178,6 +188,13 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
                 extract = true;
                 config.tui = true;
             }
+            // Opt-in best-effort structural fallback; implies --extract (and thus
+            // the grid). Default --extract is sentinel-strict (see choose_reply).
+            "--extract-structural" => {
+                extract = true;
+                extract_structural = true;
+                config.tui = true;
+            }
             "--no-jitter" => config.burst_input = true,
             "--wrap-input" => {
                 let v = take_value("--wrap-input")?;
@@ -206,6 +223,7 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
         cmds,
         config,
         extract,
+        extract_structural,
         cwd,
         program: rest[0].clone(),
         program_args: rest[1..].to_vec(),
@@ -324,7 +342,13 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
             break;
         }
     }
-    print_capture(&wrapper, tui, sentinels.as_ref(), &program);
+    print_capture(
+        &wrapper,
+        tui,
+        sentinels.as_ref(),
+        &program,
+        args.extract_structural,
+    );
     Ok(exit_code_for(&mut wrapper, last))
 }
 
@@ -333,8 +357,9 @@ fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     let tui = args.config.tui;
     let program = args.program.clone();
     // --extract has nothing to wrap here (no --cmd selects orchestrator mode),
-    // so there are no sentinel markers in the output; extraction will fall back
-    // to structural for a known CLI, or warn.
+    // so there are no sentinel markers in the output; extraction therefore warns
+    // and prints nothing (strict default), or — with --extract-structural — tries
+    // a chrome-filtered structural scrape for a known CLI.
     let mut wrapper = Wrapper::with_config(session, args.config);
     let outcome = wrapper.wait_until_idle()?;
     print_capture(
@@ -342,6 +367,7 @@ fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
         tui,
         args.extract.then(sentinels).as_ref(),
         &program,
+        args.extract_structural,
     );
     Ok(exit_code_for(&mut wrapper, outcome))
 }
@@ -362,6 +388,7 @@ fn print_capture(
     tui: bool,
     sentinels: Option<&(String, String)>,
     program: &str,
+    allow_structural: bool,
 ) {
     if let Some((begin, end)) = sentinels {
         let text = if tui {
@@ -369,14 +396,19 @@ fn print_capture(
         } else {
             wrapper.clean_log()
         };
-        match extract::choose_reply(program, &text, begin, end) {
+        match extract::choose_reply(program, &text, begin, end, allow_structural) {
             Some(s) => println!("{s}"),
-            // Neither the sentinel nor a clean structural slice yielded a reply.
-            // Print nothing (never chrome) and warn.
+            // The target did not emit the markers (and, under --extract-structural,
+            // no chrome-free slice was recoverable). Print nothing (never chrome)
+            // and warn. Suggest the opt-in only when it is not already on.
+            None if allow_structural => eprintln!(
+                "flat-cyborg: --extract found no fenced reply and no chrome-free \
+                 structural fallback; printing nothing."
+            ),
             None => eprintln!(
-                "flat-cyborg: --extract found no clean reply (the target did not \
-                 emit the markers and no chrome-free structural fallback was \
-                 available)"
+                "flat-cyborg: --extract found no fenced reply (the target did not \
+                 emit the markers); printing nothing. Pass --extract-structural \
+                 for a best-effort structural scrape of a known CLI."
             ),
         }
         io::stdout().flush().ok();
@@ -496,6 +528,48 @@ mod tests {
                     a.config.tui,
                     "--extract must imply the screen grid (config.tui)"
                 );
+            }
+            _ => panic!("expected Mode::Run"),
+        }
+    }
+
+    #[test]
+    fn plain_extract_is_sentinel_strict() {
+        let m = parse_from(vec![
+            "--extract".into(),
+            "--cmd".into(),
+            "hi".into(),
+            "--".into(),
+            "claude".into(),
+        ])
+        .expect("parse");
+        match m {
+            Mode::Run(a) => {
+                assert!(a.extract);
+                assert!(
+                    !a.extract_structural,
+                    "plain --extract must be sentinel-strict (no structural fallback)"
+                );
+            }
+            _ => panic!("expected Mode::Run"),
+        }
+    }
+
+    #[test]
+    fn extract_structural_implies_extract_and_grid() {
+        let m = parse_from(vec![
+            "--extract-structural".into(),
+            "--cmd".into(),
+            "hi".into(),
+            "--".into(),
+            "claude".into(),
+        ])
+        .expect("parse");
+        match m {
+            Mode::Run(a) => {
+                assert!(a.extract, "--extract-structural implies --extract");
+                assert!(a.extract_structural, "structural fallback opted in");
+                assert!(a.config.tui, "--extract-structural implies the screen grid");
             }
             _ => panic!("expected Mode::Run"),
         }

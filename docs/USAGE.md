@@ -82,7 +82,8 @@ flat-cyborg picks a mode automatically:
 | `--no-confirm` | Do not auto-answer `[y/n]` confirmation prompts (by default they are answered `y`). |
 | `--cwd <DIR>` | Run the target with this working directory, instead of inheriting flat-cyborg's own. Useful when you launch flat-cyborg from a parent directory but want the target (e.g. an agent) to act on a specific repo. The directory must exist (a missing one is a usage error, exit `2`). |
 | `--auto-approve` | Auto-confirm agent **approval / trust menus** — the arrow-key numbered menus that agentic CLIs show for actions the `[y/n]` auto-confirm cannot answer (e.g. codex's `git push` confirmation, claude's "trust this folder" prompt) — by pressing Enter on the default "yes/proceed/trust" option. **Bypasses the agent's own safety gates (including for destructive actions), so it is opt-in and off by default.** |
-| `--extract` | The reply-extraction mechanism (see below): wraps each `--cmd` so the target fences its reply between unique per-run markers and prints only the fenced reply; for known CLIs (claude, codex) it falls back to structural screen extraction if the model omits the markers, and never prints UI chrome. Requires `--cmd`. |
+| `--extract` | The reply-extraction mechanism (see below): wraps each `--cmd` so the target fences its reply between unique per-run markers and prints only the fenced reply. **Sentinel-strict by default** — if the markers aren't found it prints nothing and warns, so a malformed/refusal reply is empty downstream, never UI chrome. Requires `--cmd`. |
+| `--extract-structural` | Opt-in (implies `--extract`): when the markers are absent, fall back to a best-effort, chrome-filtered structural scrape of a known CLI's (claude/codex) screen. Off by default because on a refusal the scrape can return echoed-prompt prose that no chrome filter catches — prefer the strict default for programmatic capture. |
 | `--tui` | Full-screen TUI mode (see below). |
 | `--no-jitter` | Write each `--cmd` as a fast chunked burst instead of one human-cadenced keystroke at a time (40-300 ms each — minutes for a multi-thousand-char prompt). Use for programmatic LLM drivers where the anti-anomaly typing cadence is not wanted. |
 | `--wrap-input <COLS>` | Soft-fold each input line to at most `COLS` columns at word boundaries before sending (default `0` = off). An ultra-long *single* line overflows an Ink-style editor's input field so the prompt is never delivered whole; folding it (the model reads the wrapped text identically) makes a large prompt land reliably. Pairs with `--no-jitter`. |
@@ -116,19 +117,26 @@ with `--extract`.
    rather than scraped from the CLI's visible UI, this works for **any** LLM
    CLI, captures **multi-line** answers in full, and (thanks to the virtual
    terminal's scrollback) handles **long** answers that scroll off screen.
-2. **Structural fallback (known CLIs only).** Some CLIs ignore the wrap
-   instruction for longer answers (codex does). When the markers are absent and
-   the target is a known CLI (`claude`, `codex`), flat-cyborg falls back to
-   slicing the reply out of the rendered screen by recognizing that tool's
-   chrome. The sliced result is accepted only if it passes a strict cleanliness
-   check (no UI glyphs, separators, banners, or runaway lines) — so a fallback
-   never emits chrome. If neither layer yields a clean reply, flat-cyborg prints
-   nothing and warns on stderr.
+   If the markers are absent (a refusal/clarification, or a CLI that drops them),
+   the default is **strict**: flat-cyborg prints nothing and warns on stderr, so
+   downstream "is stdout empty?" cleanly means "no reply". It never scrapes the
+   screen by default.
+2. **Structural fallback — opt-in via `--extract-structural`.** Some CLIs ignore
+   the wrap instruction for longer answers (codex does). With
+   `--extract-structural`, when the markers are absent and the target is a known
+   CLI (`claude`, `codex`), flat-cyborg falls back to slicing the reply out of
+   the rendered screen by recognizing that tool's chrome, accepted only if it
+   passes a strict cleanliness check (no UI glyphs, separators, banners, or
+   runaway lines). This is **off by default**: on a refusal the scrape can return
+   echoed wrap-instruction prose — which carries no chrome glyph, so the
+   cleanliness check passes it — and hand a programmatic consumer a fragment
+   indistinguishable from a real reply. Prefer the strict default for capture;
+   use the opt-in only for best-effort human convenience.
 
 The structural fallback is per-CLI and recognizes the current claude/codex UI,
 so it may need updating if those tools redesign their interface; the sentinel
-layer and the cleanliness check bound the blast radius (worst case is a loud
-warning, never garbage).
+layer (and, when opted in, the cleanliness check) bound the blast radius — the
+default worst case is a loud warning + empty stdout, never garbage.
 
 Example — ask Claude Code one thing and print only its reply:
 
@@ -146,9 +154,9 @@ finish rendering, then flat-cyborg types the wrapped prompt, waits for the
 answer, and prints only what the model fenced between the markers.
 
 `--extract` needs at least one `--cmd` (it has to have a prompt to wrap). If the
-markers are not found and the structural fallback cannot produce a clean reply,
-flat-cyborg prints nothing to stdout and warns on stderr — it never dumps the
-raw screen.
+markers are not found, flat-cyborg prints nothing to stdout and warns on stderr
+(strict default) — it never dumps the raw screen. Pass `--extract-structural`
+to opt into the best-effort structural scrape described above.
 
 Without `--extract`, `--tui` prints the **entire** final screen (banner, input
 box, status bar, and the reply); `--extract` is what narrows it to just the
