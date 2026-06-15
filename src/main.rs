@@ -80,6 +80,12 @@ OPTIONS:
                         ultra-long single line overflows an Ink-style editor's
                         input field; folding makes a large prompt land reliably.
                         Pairs with --no-jitter (the burst path).
+    --paste-input       Deliver each --cmd via bracketed paste (ESC[200~ .. the
+                        body .. ESC[201~) then a settled Enter. An editor in
+                        bracketed-paste mode (claude/codex) takes the whole block
+                        atomically — no per-line submit, no overflow, no chunk
+                        timing. Deterministic alternative to --no-jitter; takes
+                        precedence over it. --wrap-input is unneeded under paste.
     -h, --help          Print this help.
 
 COMMANDS:
@@ -196,6 +202,7 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
                 config.tui = true;
             }
             "--no-jitter" => config.burst_input = true,
+            "--paste-input" => config.paste_input = true,
             "--wrap-input" => {
                 let v = take_value("--wrap-input")?;
                 let cols: usize = v
@@ -606,6 +613,25 @@ mod tests {
         .expect("parse");
         match m {
             Mode::Run(a) => assert_eq!(a.config.wrap_input, 72),
+            _ => panic!("expected Mode::Run"),
+        }
+    }
+
+    #[test]
+    fn paste_input_flag_sets_paste_mode() {
+        let m = parse_from(vec![
+            "--paste-input".into(),
+            "--cmd".into(),
+            "hi".into(),
+            "--".into(),
+            "claude".into(),
+        ])
+        .expect("parse");
+        match m {
+            Mode::Run(a) => {
+                assert!(a.config.paste_input, "--paste-input sets paste mode");
+                assert!(!a.config.burst_input, "paste does not imply burst");
+            }
             _ => panic!("expected Mode::Run"),
         }
     }

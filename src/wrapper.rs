@@ -88,6 +88,15 @@ pub struct WrapperConfig {
     /// (empty) reply. The watchdog (`exec_timeout`) remains the backstop if the
     /// needle never appears.
     pub idle_gate: Option<String>,
+    /// Bracketed-paste input (the `--paste-input` flag): wrap the whole command
+    /// body in `ESC[200~`/`ESC[201~` and write it in one shot, then submit with a
+    /// settled, separate `\r`. An editor in bracketed-paste mode (claude/codex
+    /// enable `ESC[?2004h`) accepts the block — newlines and all — as one atomic
+    /// paste, so there is no per-line submit, no length overflow, and no
+    /// chunk-timing heuristic. The deterministic alternative to
+    /// [`Self::burst_input`]; off by default. Takes precedence over `burst_input`
+    /// when both are set. (`wrap_input` folding is unnecessary under paste.)
+    pub paste_input: bool,
 }
 
 impl Default for WrapperConfig {
@@ -107,6 +116,7 @@ impl Default for WrapperConfig {
             burst_input: false,
             wrap_input: 0,
             idle_gate: None,
+            paste_input: false,
         }
     }
 }
@@ -246,12 +256,41 @@ impl Wrapper {
     /// # Errors
     /// Returns an error if writing to the master fails.
     pub fn send(&mut self, command: &str) -> Result<()> {
+        if self.config.paste_input {
+            return self.send_paste(command);
+        }
         if self.config.burst_input {
             return self.send_burst(command);
         }
         let session = &self.session;
         self.jitter
             .type_command(command, |bytes| session.write_input(bytes))
+    }
+
+    /// Bracketed-paste input path ([`WrapperConfig::paste_input`]): wrap the whole
+    /// command body in the bracketed-paste markers `ESC[200~`/`ESC[201~` and write
+    /// it in one shot, then submit with a settled, separate `\r`.
+    ///
+    /// An Ink-style editor that has enabled bracketed-paste mode (`ESC[?2004h`,
+    /// which claude/codex do) accepts the entire block — newlines and all — as
+    /// literal pasted text in one atomic operation: no per-line submit, no
+    /// length-based input overflow, no chunk-timing heuristic. The trailing `\r`
+    /// (after the paste-end marker + a settle) is the deliberate submit. This is
+    /// the deterministic alternative to the chunked [`Self::send_burst`].
+    ///
+    /// Newlines in the body are left as `\n`: paste content is literal, so the
+    /// editor inserts them as line breaks rather than submitting on them.
+    ///
+    /// # Errors
+    /// Returns an error if writing to the master fails.
+    pub fn send_paste(&mut self, command: &str) -> Result<()> {
+        /// Settle before the submit Enter so the editor has finished ingesting
+        /// the paste and accepts the `\r` as a deliberate submit.
+        const SUBMIT_SETTLE: Duration = Duration::from_millis(250);
+        let seq = bracketed_paste(command);
+        self.session.write_input(&seq)?;
+        thread::sleep(SUBMIT_SETTLE);
+        self.session.write_input(b"\r")
     }
 
     /// Fast input path for [`WrapperConfig::burst_input`]: write the command
@@ -519,6 +558,19 @@ fn fold_line(line: &str, width: usize, out: &mut Vec<String>) {
         start = cut;
     }
     out.push(chars[start..].iter().collect());
+}
+
+/// Wraps `body` in the bracketed-paste markers (`ESC[200~` … `ESC[201~`) that an
+/// editor in bracketed-paste mode reads as one atomic paste. Does NOT include the
+/// submit `\r` (the caller sends that separately after a settle).
+pub(crate) fn bracketed_paste(body: &str) -> Vec<u8> {
+    const PASTE_BEGIN: &[u8] = b"\x1b[200~";
+    const PASTE_END: &[u8] = b"\x1b[201~";
+    let mut out = Vec::with_capacity(PASTE_BEGIN.len() + body.len() + PASTE_END.len());
+    out.extend_from_slice(PASTE_BEGIN);
+    out.extend_from_slice(body.as_bytes());
+    out.extend_from_slice(PASTE_END);
+    out
 }
 
 #[cfg(test)]
@@ -879,5 +931,27 @@ mod tests {
         // The model emitting it on its own line — even indented — opens the gate.
         let reply = "thinking…\n  FCB_abc_BEGIN\nthe answer line\n";
         assert!(transcript_has_line(reply, begin));
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_body_in_markers_without_submit() {
+        let seq = bracketed_paste("line one\nline two");
+        assert!(
+            seq.starts_with(b"\x1b[200~"),
+            "must start with the paste-begin marker"
+        );
+        assert!(
+            seq.ends_with(b"\x1b[201~"),
+            "must end with the paste-end marker"
+        );
+        // The body is carried verbatim (newlines preserved, no \r submit inside).
+        let inner = &seq[b"\x1b[200~".len()..seq.len() - b"\x1b[201~".len()];
+        assert_eq!(inner, b"line one\nline two");
+        assert!(!seq.contains(&b'\r'), "the paste sequence must not submit");
+    }
+
+    #[test]
+    fn bracketed_paste_handles_empty_body() {
+        assert_eq!(bracketed_paste(""), b"\x1b[200~\x1b[201~");
     }
 }

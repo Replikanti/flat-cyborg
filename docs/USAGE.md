@@ -87,6 +87,7 @@ flat-cyborg picks a mode automatically:
 | `--tui` | Full-screen TUI mode (see below). |
 | `--no-jitter` | Write each `--cmd` as a fast chunked burst instead of one human-cadenced keystroke at a time (40-300 ms each — minutes for a multi-thousand-char prompt). Use for programmatic LLM drivers where the anti-anomaly typing cadence is not wanted. |
 | `--wrap-input <COLS>` | Soft-fold each input line to at most `COLS` columns at word boundaries before sending (default `0` = off). An ultra-long *single* line overflows an Ink-style editor's input field so the prompt is never delivered whole; folding it (the model reads the wrapped text identically) makes a large prompt land reliably. Pairs with `--no-jitter`. |
+| `--paste-input` | Deliver each `--cmd` via **bracketed paste** (`ESC[200~` + body + `ESC[201~`) then a settled Enter, instead of typing it. An editor in bracketed-paste mode (claude/codex) takes the whole block atomically — no per-line submit, no length overflow, no chunk-timing heuristic — a deterministic alternative to `--no-jitter` (and `--wrap-input` is unnecessary under it). Takes precedence over `--no-jitter`. |
 | `-h`, `--help` | Print help. |
 
 ### `--tui` mode
