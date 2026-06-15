@@ -60,7 +60,9 @@ OPTIONS:
                         with unique markers and prints the fenced reply; for
                         known CLIs (claude, codex) falls back to structural
                         screen extraction if the model omits the markers. Never
-                        prints UI chrome (needs --cmd).
+                        prints UI chrome (needs --cmd). Implies the 2D screen-grid
+                        capture (as --tui) since the reply is read from the
+                        rendered screen — required for alt-screen CLIs like claude.
     --no-jitter         Write each --cmd as a single burst with no per-keystroke
                         human-cadence delay. The default jitter types one char
                         at a time (40-300 ms each), which is minutes for a
@@ -94,8 +96,12 @@ enum Mode {
 }
 
 fn parse_args() -> Result<Mode, String> {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
+    parse_from(std::env::args().skip(1).collect())
+}
 
+/// Pure arg-parsing core, split out so it can be unit-tested without touching
+/// the process-global `std::env::args`.
+fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
     // Split on the first `--` first, so flat-cyborg's own flags (`-h`/`--help`,
     // `--version`/`-V`) are only honored before it, never when they are
     // arguments to the target program after `--`.
@@ -158,7 +164,15 @@ fn parse_args() -> Result<Mode, String> {
             "--auto-approve" => config.auto_approve = true,
             "--cwd" => cwd = Some(take_value("--cwd")?),
             "--tui" => config.tui = true,
-            "--extract" => extract = true,
+            // --extract structurally needs the 2D screen grid: its transcript is
+            // the screen's full_text (scrollback included), and a full-screen
+            // alt-screen CLI (e.g. claude) is invisible to the line-log path. So
+            // --extract implies the grid capture — otherwise it silently yields
+            // no reply for exactly the alt-screen TUIs it is meant to read.
+            "--extract" => {
+                extract = true;
+                config.tui = true;
+            }
             "--no-jitter" => config.burst_input = true,
             other => return Err(format!("unknown option: {other}")),
         }
@@ -440,5 +454,30 @@ mod tests {
         assert!(w.starts_with("hello\n\n"));
         assert!(w.contains("B_BEGIN"));
         assert!(w.contains("B_END"));
+    }
+
+    #[test]
+    fn extract_implies_screen_grid() {
+        // --extract reads the reply from the rendered screen, so it must turn on
+        // the grid capture (config.tui) even when --tui is not passed — otherwise
+        // it silently yields nothing for alt-screen CLIs like claude.
+        let m = parse_from(vec![
+            "--extract".into(),
+            "--cmd".into(),
+            "hi".into(),
+            "--".into(),
+            "claude".into(),
+        ])
+        .expect("parse");
+        match m {
+            Mode::Run(a) => {
+                assert!(a.extract, "extract flag should be set");
+                assert!(
+                    a.config.tui,
+                    "--extract must imply the screen grid (config.tui)"
+                );
+            }
+            _ => panic!("expected Mode::Run"),
+        }
     }
 }
