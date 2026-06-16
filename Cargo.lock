@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "flat-cyborg"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "pty-process",
  "rustix",

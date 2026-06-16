@@ -249,6 +249,26 @@ fn sentinels() -> (String, String) {
     (format!("FCB_{tok}_BEGIN"), format!("FCB_{tok}_END"))
 }
 
+/// The IDLE gate for the orchestrator, given the (optional) sentinel pair and whether
+/// the structural fallback (`--extract-structural`) is enabled.
+///
+/// - Strict `--extract` (sentinels present, NOT structural) → `Some(end)`: gate IDLE on
+///   the closing marker so a mid-think pause is not mistaken for a finished reply.
+/// - `--extract-structural` → `None`: the model intermittently omits the sentinel (e.g.
+///   claude refusing the wrap protocol). Marker-gating then burns the full `--timeout-ms`
+///   and FAILS even though the structural fallback could recover the reply. With no gate a
+///   SETTLED screen is treated as idle (like `--tui`) and the reply is scraped (marker
+///   first, structural fallback) — fast AND marker-less-tolerant.
+/// - No `--extract` → `None` (unchanged).
+///
+/// Pure so it is unit-testable without a PTY. (#55)
+fn idle_gate_for(sentinels: &Option<(String, String)>, extract_structural: bool) -> Option<String> {
+    match sentinels {
+        Some((_, end)) if !extract_structural => Some(end.clone()),
+        _ => None,
+    }
+}
+
 /// Appends the sentinel wrap instruction to a typed command, asking the target
 /// to fence its reply between the per-run markers.
 ///
@@ -336,13 +356,12 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
     // markers are used for both wrapping and extraction.
     let sentinels = args.extract.then(sentinels);
     let mut config = args.config;
-    // In --extract, gate IDLE on the END marker appearing on its own line: the
-    // model may emit startup chrome and then pause to think before replying, and
-    // that pause must not be mistaken for a finished (empty) reply. The watchdog
-    // (--timeout-ms) remains the backstop if the markers never appear.
-    if let Some((_, end)) = &sentinels {
-        config.idle_gate = Some(end.clone());
-    }
+    // IDLE gating depends on the extract mode (see `idle_gate_for`): strict --extract
+    // marker-gates IDLE (a mid-think pause must not be mistaken for a finished reply);
+    // --extract-structural does NOT, so a marker-less reply (the model intermittently
+    // omits the sentinel) completes on a settled screen and is recovered structurally
+    // instead of burning the full --timeout-ms and failing. (#55)
+    config.idle_gate = idle_gate_for(&sentinels, args.extract_structural);
     let mut wrapper = Wrapper::with_config(session, config);
     let mut last = Outcome::Completed;
     for cmd in &args.cmds {
@@ -513,6 +532,18 @@ mod tests {
         assert!(e.ends_with("_END"));
         assert!(b.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
         assert!(e.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    }
+
+    #[test]
+    fn idle_gate_for_modes() {
+        let s = Some(("FCB_x_BEGIN".to_string(), "FCB_x_END".to_string()));
+        // strict --extract: gate IDLE on the closing marker.
+        assert_eq!(idle_gate_for(&s, false), Some("FCB_x_END".to_string()));
+        // --extract-structural: NO marker gate (settle-based, marker-less-tolerant).
+        assert_eq!(idle_gate_for(&s, true), None);
+        // no --extract: no gate, regardless of the structural flag.
+        assert_eq!(idle_gate_for(&None, false), None);
+        assert_eq!(idle_gate_for(&None, true), None);
     }
 
     #[test]

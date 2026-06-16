@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] — 2026-06-16
+
+### Fixed
+
+- `--extract-structural` now completes on a SETTLED screen instead of marker-gating
+  IDLE. Strict `--extract` waits for the closing sentinel; if the model omits it
+  (claude intermittently refuses the wrap protocol) the gate never opens, the wrapper
+  burns the entire `--timeout-ms` and exits "no fenced reply", and a programmatic
+  caller retries — observed as repeated ~700 s hangs that end in failure. With
+  `--extract-structural` the IDLE gate is now `None` (a settled screen is idle, like
+  `--tui`) and the reply is recovered marker-first → structural-fallback: fast AND
+  marker-less-tolerant. Strict `--extract` (no `--extract-structural`) is unchanged.
+  Fixes #55.
+
 ## [0.10.1] — 2026-06-16
 
 ### Fixed
@@ -29,5 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `codex --extract`: single-line `wrap_command` + line-end fence integrity (#40).
 - `--paste-input`: bracketed-paste input delivery, opt-in (#49).
 
+[0.10.2]: https://github.com/Replikanti/flat-cyborg/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/Replikanti/flat-cyborg/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Replikanti/flat-cyborg/releases/tag/v0.10.0
