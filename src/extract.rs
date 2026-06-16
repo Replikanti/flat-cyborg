@@ -640,4 +640,31 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn choose_reply_recovers_reply_from_claude_indented_bullet_block() {
+        // The #53 repro layout: claude v2.1.177 echoes the prompt with the
+        // wrap-instruction prose on the same line as the `❯`, then renders its
+        // reply as a `●` bullet block with BOTH markers and the body indented two
+        // spaces. The sentinel fence must still be found (the marker scan keys on
+        // what FOLLOWS the marker, so leading indentation is irrelevant) and the
+        // recovered reply must be just the clean body — no markers, no chrome.
+        let begin = "FCB_X_BEGIN";
+        let end = "FCB_X_END";
+        let transcript = "\
+❯ what is 2+2?    IMPORTANT: wrap your reply between the markers ...
+● FCB_X_BEGIN
+  2+2 equals 4.
+  FCB_X_END
+✻ Brewed for 3s
+";
+        let reply = choose_reply("claude", transcript, begin, end, false)
+            .expect("the indented closing marker must still form a real fence");
+        assert_eq!(reply.trim(), "2+2 equals 4.");
+        // Strict default (no structural fallback) must work purely from the
+        // fence, so it also holds when structural is opted in.
+        let reply_struct = choose_reply("claude", transcript, begin, end, true)
+            .expect("fence must win regardless of allow_structural");
+        assert_eq!(reply_struct.trim(), "2+2 equals 4.");
+    }
 }
