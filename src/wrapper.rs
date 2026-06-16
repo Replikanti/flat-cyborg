@@ -239,7 +239,18 @@ impl Wrapper {
         if self.config.tui {
             // Let the TUI finish its current render and become ready for input
             // before typing, so keystrokes are not dropped during a redraw.
-            match self.wait_until_idle()? {
+            //
+            // The sentinel idle-gate (set for `--extract`) must NOT apply to
+            // this readiness wait: the model's closing marker cannot appear
+            // before the prompt is even typed, so gating here would never
+            // complete — the wait would burn the whole watchdog and `send()`
+            // below would never run, so the prompt is never delivered and the
+            // reply is empty. The gate belongs only to the post-typing reply
+            // wait. Disable it for the readiness wait, then restore it.
+            let saved_gate = self.config.idle_gate.take();
+            let ready = self.wait_until_idle();
+            self.config.idle_gate = saved_gate;
+            match ready? {
                 Outcome::Idle => {}
                 other => return Ok(other),
             }
@@ -469,6 +480,22 @@ impl Wrapper {
                         } else {
                             approval_answered = false;
                         }
+                    }
+
+                    // Sentinel completion: when a gate is set (`--extract`), the
+                    // closing marker on its own line is a definitive "reply
+                    // complete" signal — it is the last thing the model emits. An
+                    // animated TUI (e.g. claude rotates its idle "Try ..." hints)
+                    // may never fall silent, so the silence-gated `Output::Idle`
+                    // arm below can miss the reply before it scrolls out of the
+                    // alt-screen. Completing the moment the gate opens — on the
+                    // chunk that renders the marker, while the reply is still on
+                    // the grid — fixes that. The watchdog remains the backstop if
+                    // the marker never appears. (`idle_gate_open()` reads the
+                    // just-fed screen grid in TUI mode.)
+                    if self.config.idle_gate.is_some() && self.idle_gate_open() {
+                        self.state = State::Idle;
+                        return Ok(Outcome::Idle);
                     }
                 }
                 Output::Idle => {
@@ -931,6 +958,24 @@ mod tests {
         // The model emitting it on its own line — even indented — opens the gate.
         let reply = "thinking…\n  FCB_abc_BEGIN\nthe answer line\n";
         assert!(transcript_has_line(reply, begin));
+    }
+
+    #[test]
+    fn idle_gate_opens_on_indented_closing_marker_claude_layout() {
+        // claude v2.1.177 renders the reply as an indented bullet block: the
+        // closing END marker lands two spaces under the `●` block, never flush
+        // left. The sentinel gate (and so the #53 on-output completion) must
+        // still recognise it as a standalone marker line — otherwise the gate
+        // never opens and `--extract` waits out the watchdog, by which time the
+        // animated idle TUI has scrolled the reply out of the alt-screen. The
+        // gate keys on the CLOSING marker — the last thing the model emits — so
+        // it being on its own indented line is what matters; the BEGIN marker
+        // shares the `●` bullet's line and need not stand alone.
+        let transcript = "● FCB_X_BEGIN\n  2+2 = 4.\n  FCB_X_END\n";
+        assert!(transcript_has_line(transcript, "FCB_X_END"));
+        // The bullet-prefixed BEGIN line is not a standalone marker, and the gate
+        // does not require it to be.
+        assert!(!transcript_has_line(transcript, "FCB_X_BEGIN"));
     }
 
     #[test]
