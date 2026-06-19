@@ -40,6 +40,10 @@ USAGE:
 OPTIONS:
     --cmd <TEXT>        Type TEXT into the target (repeatable). Selects
                         orchestrator mode.
+    --cmd-file <PATH>   Like --cmd but read the prompt text from PATH. Use for
+                        large prompts: a multi-MB prompt as an argv value
+                        overflows ARG_MAX (the Argument-list-too-long limit);
+                        a file does not. Repeatable; selects orchestrator mode.
     --timeout-ms <N>    Execution timeout per operation (default 60000).
     --idle-ms <N>       Silence after the prompt before declaring IDLE
                         (default 500).
@@ -168,6 +172,16 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
         };
         match opt.as_str() {
             "--cmd" => cmds.push(take_value("--cmd")?),
+            // Like --cmd, but the prompt text is read from a file instead of an
+            // argv value. A multi-MB prompt as a command-line argument overflows
+            // ARG_MAX (E2BIG / "Argument list too long"); a file does not.
+            // Selects orchestrator mode exactly like --cmd. Repeatable.
+            "--cmd-file" => {
+                let path = take_value("--cmd-file")?;
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("--cmd-file {path}: {e}"))?;
+                cmds.push(text);
+            }
             "--prompt" => prompts.push(take_value("--prompt")?),
             "--timeout-ms" => {
                 let v = take_value("--timeout-ms")?;
@@ -583,6 +597,33 @@ mod tests {
                 assert!(
                     a.config.tui,
                     "--extract must imply the screen grid (config.tui)"
+                );
+            }
+            _ => panic!("expected Mode::Run"),
+        }
+    }
+
+    #[test]
+    fn cmd_file_reads_prompt_from_file() {
+        // --cmd-file must read the prompt text from the file (so a multi-MB
+        // prompt does not overflow ARG_MAX), and select orchestrator mode the
+        // same way --cmd does.
+        let path = std::env::temp_dir().join("flat-cyborg-cmdfile-test.txt");
+        std::fs::write(&path, "hello from file\nsecond line").expect("write");
+        let m = parse_from(vec![
+            "--cmd-file".into(),
+            path.to_string_lossy().into_owned(),
+            "--".into(),
+            "claude".into(),
+        ])
+        .expect("parse");
+        std::fs::remove_file(&path).ok();
+        match m {
+            Mode::Run(a) => {
+                assert_eq!(
+                    a.cmds,
+                    vec!["hello from file\nsecond line".to_string()],
+                    "--cmd-file should push the file's content as a cmd"
                 );
             }
             _ => panic!("expected Mode::Run"),

@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-06-20
+
+### Added
+
+- `--cmd-file <PATH>` — read the prompt text from a file instead of an argv
+  value. A multi-MB prompt passed as `--cmd <TEXT>` overflows `ARG_MAX`
+  (`exec` fails E2BIG / "Argument list too long"); reading it from a file
+  does not. Repeatable; selects orchestrator mode exactly like `--cmd`.
+  Found driving the agentis dev-apprenticeship federation on a real repo,
+  where agents build multi-MB contexts (Replikanti/agentis-colonies#1171).
+
 ## [0.10.2] — 2026-06-16
 
 ### Fixed
