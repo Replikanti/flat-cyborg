@@ -67,7 +67,7 @@ flat-cyborg picks a mode automatically:
 
 | Mode | When | What it does |
 |------|------|--------------|
-| **Orchestrator** | one or more `--cmd` given | Types each command into the target (with human-like jitter), waits for the target to return to idle (or exit) between commands, then prints the captured output. |
+| **Orchestrator** | one or more `--cmd` / `--cmd-file` given | Types each command into the target (with human-like jitter), waits for the target to return to idle (or exit) between commands, then prints the captured output. |
 | **Capture** | no `--cmd`, stdin is not a terminal (e.g. piped) | Runs the target to completion and prints its sanitized output. |
 | **Interactive** | no `--cmd`, stdin is a terminal | Puts your terminal in raw mode and forwards your keystrokes to the target while mirroring its raw output — a transparent PTY passthrough. Restored to normal on exit. |
 
@@ -76,6 +76,7 @@ flat-cyborg picks a mode automatically:
 | Flag | Description |
 |------|-------------|
 | `--cmd <TEXT>` | Type `TEXT` into the target (repeatable). Selects orchestrator mode. |
+| `--cmd-file <PATH>` | Like `--cmd` but read the prompt text from `PATH`. Use for large prompts: a multi-megabyte prompt passed as an argv value overflows `ARG_MAX` (the `Argument list too long` limit); a file does not. Repeatable, combines with `--cmd`; selects orchestrator mode. |
 | `--timeout-ms <N>` | Per-operation execution timeout before the watchdog intervenes (default 60000). |
 | `--idle-ms <N>` | How long output must be silent before the target is considered idle (default 500). Raise it for slow or animated targets. |
 | `--prompt <TOKEN>` | Trailing prompt token that marks idle (repeatable; defaults to common shell prompts `$ `, `# `, `> `, `% `). |
@@ -163,6 +164,29 @@ Without `--extract`, `--tui` prints the **entire** final screen (banner, input
 box, status bar, and the reply); `--extract` is what narrows it to just the
 answer.
 
+### Large prompts
+
+Three limits bite when the prompt gets big, each with its own flag:
+
+1. **The OS argument limit.** A prompt passed via `--cmd` lives on the command
+   line; past `ARG_MAX` (typically ~2 MB total argv) the kernel refuses to exec
+   at all (`Argument list too long`). Put the prompt in a file and pass
+   `--cmd-file prompt.txt` instead.
+2. **Typing time.** The default human-cadence jitter types one character at a
+   time — minutes for a multi-thousand-character prompt. Pass `--paste-input`
+   (bracketed paste, atomic and deterministic — preferred) or `--no-jitter`
+   (fast chunked burst).
+3. **Editor line overflow** (burst path only). An ultra-long single line can
+   overflow an Ink-style editor's input field; `--wrap-input 72` soft-folds it.
+   Not needed under `--paste-input`.
+
+Putting it together for a programmatic driver:
+
+```sh
+flat-cyborg --extract --paste-input --idle-ms 30000 --timeout-ms 240000 \
+  --cmd-file prompt.txt -- claude
+```
+
 > **Note on onboarding.** Run the LLM CLI in a directory it already trusts, or
 > point it at one with `--cwd <repo>`. On first use in a new directory, these
 > tools show an arrow-key "trust this folder" menu (not a `[y/n]` prompt), which
@@ -195,6 +219,7 @@ does not, or when you specifically need the interactive path.
 |------|---------|
 | `0` | Success — target exited 0, or returned to an idle prompt. |
 | target's code | In capture/orchestrator mode, the target's own exit status is propagated. |
+| `1` | Generic failure — flat-cyborg itself failed (e.g. the target could not be spawned), or the target was killed by a signal. |
 | `2` | Usage error (bad arguments). |
 | `124` | The watchdog timed out and aborted the operation. |
 
