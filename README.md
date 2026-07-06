@@ -15,6 +15,15 @@ than headless mode. It intercepts both I/O streams, emulates human-like input
 timing, and deterministically detects the target's lifecycle state by parsing
 the output ANSI stream.
 
+**Why it exists:** some CLIs only expose their full capability — or a different
+billing model — in their interactive mode. The motivating case is AI coding
+CLIs (Claude Code, codex): driving the *interactive* session programmatically
+lets an automation pipeline run on a flat-rate subscription seat instead of a
+metered API, and reach features the headless mode lacks. flat-cyborg makes that
+interactive session scriptable: send a prompt, wait for the real answer, print
+only the reply (`--extract`). It stays fully generic — any interactive CLI, no
+app-specific code.
+
 ## Capabilities
 
 - **PTY & process lifecycle** — spawns the target inside a master/slave PTY pair
@@ -38,8 +47,12 @@ the output ANSI stream.
 
 ## Status
 
-Early development. Components land incrementally via trunk-based development;
-see the open pull requests and the issue tracker for the current state.
+Actively developed and in production use — it is the LLM-backend driver of the
+[agentis-colonies](https://github.com/Replikanti/agentis-colonies) federations,
+where it runs unattended around the clock. Changes land incrementally via
+trunk-based development; releases are tagged with prebuilt binaries for
+Linux/macOS × x86_64/aarch64. See the [releases page](https://github.com/Replikanti/flat-cyborg/releases)
+and the issue tracker for current state.
 
 ## Installing
 
@@ -66,10 +79,17 @@ flat-cyborg --cmd 'echo hi' --cmd 'exit' -- sh -i
 # Wrap an LLM CLI and capture just its reply:
 flat-cyborg --tui --extract --idle-ms 4000 \
   --cmd 'Reply with one word: pineapple' -- claude
+
+# Large prompt? Read it from a file (no ARG_MAX limit) and deliver it
+# atomically via bracketed paste:
+flat-cyborg --extract --paste-input --cmd-file prompt.txt -- claude
 ```
 
 See the [**Usage Guide**](docs/USAGE.md) for the full reference — modes, every
-option, `--tui` and `--extract`, exit codes, self-update, and troubleshooting.
+option, `--tui` and `--extract`, large-prompt delivery (`--cmd-file`,
+`--paste-input`, `--no-jitter`, `--wrap-input`), exit codes, self-update, and
+troubleshooting. Security posture and vulnerability reporting:
+[SECURITY.md](SECURITY.md).
 
 Update an installed binary with `flat-cyborg update` (`flat-cyborg version` to
 check the installed version).
