@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] — 2026-07-15
+
+### Fixed
+
+- `--cmd` and `--cmd-file` are now mutually exclusive: using both together
+  produces a clear error. Previously, when both were provided, the tool would
+  silently prefer one over the other depending on parse order, creating an
+  ambiguous user-error trap.
+- `--cmd-file` content is now `.trim_end()`'d before use, matching the behavior
+  of `--cmd` (which receives argv values already trimmed by the shell). This
+  fixes whitespace-parity inconsistency where file-sourced prompts retained
+  trailing newlines while argv-sourced ones did not.
+- Added `#[derive(Debug)]` to `Args` and `Mode` for improved debugging support.
+
 ## [0.12.0] — 2026-07-15
 
 ### Changed
@@ -67,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `codex --extract`: single-line `wrap_command` + line-end fence integrity (#40).
 - `--paste-input`: bracketed-paste input delivery, opt-in (#49).
 
+[0.12.1]: https://github.com/Replikanti/flat-cyborg/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/Replikanti/flat-cyborg/compare/v0.10.1...v0.10.2
