@@ -100,6 +100,7 @@ With no --cmd, a terminal stdin starts interactive passthrough; a piped stdin
 runs the target to completion and prints its sanitized output.
 ";
 
+#[derive(Debug)]
 struct Args {
     cmds: Vec<String>,
     config: WrapperConfig,
@@ -113,6 +114,7 @@ struct Args {
 }
 
 /// What the parsed command line asks for.
+#[derive(Debug)]
 enum Mode {
     Help,
     Version,
@@ -155,6 +157,8 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
     }
 
     let mut cmds = Vec::new();
+    let mut has_cmd = false;
+    let mut has_cmd_file = false;
     let mut config = WrapperConfig::default();
     let mut prompts: Vec<String> = Vec::new();
     let mut extract = false;
@@ -171,16 +175,26 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
                 .ok_or_else(|| format!("{name} requires a value"))
         };
         match opt.as_str() {
-            "--cmd" => cmds.push(take_value("--cmd")?),
+            "--cmd" => {
+                if has_cmd_file {
+                    return Err("--cmd and --cmd-file are mutually exclusive".into());
+                }
+                has_cmd = true;
+                cmds.push(take_value("--cmd")?);
+            }
             // Like --cmd, but the prompt text is read from a file instead of an
             // argv value. A multi-MB prompt as a command-line argument overflows
             // ARG_MAX (E2BIG / "Argument list too long"); a file does not.
             // Selects orchestrator mode exactly like --cmd. Repeatable.
             "--cmd-file" => {
+                if has_cmd {
+                    return Err("--cmd and --cmd-file are mutually exclusive".into());
+                }
+                has_cmd_file = true;
                 let path = take_value("--cmd-file")?;
                 let text = std::fs::read_to_string(&path)
                     .map_err(|e| format!("--cmd-file {path}: {e}"))?;
-                cmds.push(text);
+                cmds.push(text.trim_end().to_string());
             }
             "--prompt" => prompts.push(take_value("--prompt")?),
             "--timeout-ms" => {
@@ -609,7 +623,7 @@ mod tests {
         // prompt does not overflow ARG_MAX), and select orchestrator mode the
         // same way --cmd does.
         let path = std::env::temp_dir().join("flat-cyborg-cmdfile-test.txt");
-        std::fs::write(&path, "hello from file\nsecond line").expect("write");
+        std::fs::write(&path, "hello from file\nsecond line\n").expect("write");
         let m = parse_from(vec![
             "--cmd-file".into(),
             path.to_string_lossy().into_owned(),
@@ -623,11 +637,52 @@ mod tests {
                 assert_eq!(
                     a.cmds,
                     vec!["hello from file\nsecond line".to_string()],
-                    "--cmd-file should push the file's content as a cmd"
+                    "--cmd-file should push the file's content as a cmd, trailing whitespace trimmed"
                 );
             }
             _ => panic!("expected Mode::Run"),
         }
+    }
+
+    #[test]
+    fn cmd_and_cmd_file_are_mutually_exclusive() {
+        // --cmd and --cmd-file both select orchestrator mode from different
+        // sources; combining them is ambiguous and must be rejected.
+        let path = std::env::temp_dir().join("flat-cyborg-cmdfile-mutex-test.txt");
+        std::fs::write(&path, "from file").expect("write");
+        let err = parse_from(vec![
+            "--cmd".into(),
+            "from argv".into(),
+            "--cmd-file".into(),
+            path.to_string_lossy().into_owned(),
+            "--".into(),
+            "claude".into(),
+        ])
+        .expect_err("expected an error");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            err.contains("mutually exclusive"),
+            "error should mention mutual exclusivity: {err:?}"
+        );
+    }
+
+    #[test]
+    fn cmd_file_missing_path_reports_the_flag_name() {
+        // A --cmd-file pointing at a non-existent path must fail with an error
+        // that names the flag, so the caller knows which argument was bad.
+        let path = std::env::temp_dir().join("flat-cyborg-cmdfile-does-not-exist.txt");
+        std::fs::remove_file(&path).ok();
+        let err = parse_from(vec![
+            "--cmd-file".into(),
+            path.to_string_lossy().into_owned(),
+            "--".into(),
+            "claude".into(),
+        ])
+        .expect_err("expected an error for a missing file");
+        assert!(
+            err.contains("--cmd-file"),
+            "error should name the --cmd-file flag: {err:?}"
+        );
     }
 
     #[test]
