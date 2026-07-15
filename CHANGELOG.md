@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] — 2026-07-15
+
+### Changed
+
+- `--no-jitter` burst input path now enforces a conservative `BURST_MAX_BYTES` size
+  guardrail: prompts larger than ~4 KB sent via burst mode fail loudly with a clear
+  error directing the user to `--paste-input`, instead of the previous behavior
+  (silent mis-delivery to stdout/garbage replies). The guardrail is a precaution
+  against prompt-shape-dependent delivery failures (issue #60); it does not guarantee
+  reliability below the line. Large prompts must use `--paste-input` for deterministic
+  delivery.
+- Updated `bitflags` dependency to 2.13.0 to clear yanked-crate warnings.
+
 ## [0.11.0] — 2026-06-20
 
 ### Added
@@ -54,6 +67,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `codex --extract`: single-line `wrap_command` + line-end fence integrity (#40).
 - `--paste-input`: bracketed-paste input delivery, opt-in (#49).
 
+[0.12.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/Replikanti/flat-cyborg/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/Replikanti/flat-cyborg/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Replikanti/flat-cyborg/releases/tag/v0.10.0
