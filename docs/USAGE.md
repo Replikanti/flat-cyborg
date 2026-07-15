@@ -86,8 +86,8 @@ flat-cyborg picks a mode automatically:
 | `--extract` | The reply-extraction mechanism (see below): wraps each `--cmd` so the target fences its reply between unique per-run markers and prints only the fenced reply. **Sentinel-strict by default** — if the markers aren't found it prints nothing and warns, so a malformed/refusal reply is empty downstream, never UI chrome. Requires `--cmd`. |
 | `--extract-structural` | Opt-in (implies `--extract`): when the markers are absent, fall back to a best-effort, chrome-filtered structural scrape of a known CLI's (claude/codex) screen. Off by default because on a refusal the scrape can return echoed-prompt prose that no chrome filter catches — prefer the strict default for programmatic capture. |
 | `--tui` | Full-screen TUI mode (see below). |
-| `--no-jitter` | Write each `--cmd` as a fast chunked burst instead of one human-cadenced keystroke at a time (40-300 ms each — minutes for a multi-thousand-char prompt). Use for programmatic LLM drivers where the anti-anomaly typing cadence is not wanted. |
-| `--wrap-input <COLS>` | Soft-fold each input line to at most `COLS` columns at word boundaries before sending (default `0` = off). An ultra-long *single* line overflows an Ink-style editor's input field so the prompt is never delivered whole; folding it (the model reads the wrapped text identically) makes a large prompt land reliably. Pairs with `--no-jitter`. |
+| `--no-jitter` | Write each `--cmd` as a fast chunked burst instead of one human-cadenced keystroke at a time (40-300 ms each — minutes for a multi-thousand-char prompt). Use for programmatic LLM drivers where the anti-anomaly typing cadence is not wanted. Best-effort for large prompts only: as a precaution it errors out above a conservative size guardrail (a policy line, not a proven boundary; measured *after* `--wrap-input` folding) and directs you to `--paste-input`, which delivers large prompts deterministically. |
+| `--wrap-input <COLS>` | Soft-fold each input line to at most `COLS` columns at word boundaries before sending (default `0` = off). An ultra-long *single* line overflows an Ink-style editor's input field so the prompt is never delivered whole; folding it (the model reads the wrapped text identically) makes a large prompt land reliably. Pairs with `--no-jitter` — but for large prompts prefer `--paste-input`, which needs no folding and is not size-capped. (Folding inserts line breaks, so it *grows* the byte count the `--no-jitter` size guardrail measures.) |
 | `--paste-input` | Deliver each `--cmd` via **bracketed paste** (`ESC[200~` + body + `ESC[201~`) then a settled Enter, instead of typing it. An editor in bracketed-paste mode (claude/codex) takes the whole block atomically — no per-line submit, no length overflow, no chunk-timing heuristic — a deterministic alternative to `--no-jitter` (and `--wrap-input` is unnecessary under it). Takes precedence over `--no-jitter`. |
 | `-h`, `--help` | Print help. |
 
@@ -175,7 +175,15 @@ Three limits bite when the prompt gets big, each with its own flag:
 2. **Typing time.** The default human-cadence jitter types one character at a
    time — minutes for a multi-thousand-character prompt. Pass `--paste-input`
    (bracketed paste, atomic and deterministic — preferred) or `--no-jitter`
-   (fast chunked burst).
+   (fast chunked burst). Burst delivery of large prompts is only best-effort —
+   it can mis-deliver depending on the prompt's *shape*, not just its size — so
+   as a precaution `--no-jitter` **errors out** above a conservative size
+   guardrail and points you to `--paste-input`; use that for anything large.
+   The guardrail is a policy line, not a proven safe boundary: it catches the
+   clearly-oversized case, but it does not guarantee that every sub-guardrail
+   burst delivers. The byte count in that error is measured *after*
+   `--wrap-input` folding (which inserts line breaks), so it can exceed your
+   raw input length.
 3. **Editor line overflow** (burst path only). An ultra-long single line can
    overflow an Ink-style editor's input field; `--wrap-input 72` soft-folds it.
    Not needed under `--paste-input`.
