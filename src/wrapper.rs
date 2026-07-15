@@ -21,11 +21,12 @@
 //! raw mode to restore. The interactive demo front-end, which does put the host
 //! TTY in raw mode, owns that cleanup via an RAII guard.
 
+use std::io;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ansi::{is_approval_menu, is_confirmation_prompt, line_ends_with_any, Sanitizer};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::jitter::Jitter;
 use crate::pty::{Output, PtySession, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::screen::Screen;
@@ -143,6 +144,23 @@ pub enum Outcome {
     /// The watchdog aborted the operation after `exec_timeout`.
     TimedOut,
 }
+
+/// Conservative size guardrail (in delivered bytes) above which the
+/// `--no-jitter` burst path refuses to deliver and requires `--paste-input`.
+///
+/// This is a POLICY line, not a measured reliability boundary. The burst
+/// mis-delivery documented in issue #60 (empty / truncated-to-tail / garbled
+/// replies) is intermittent and prompt-shape dependent, not purely size-bound,
+/// so no scalar threshold can cleanly separate a prompt that delivers from one
+/// that does not: a smaller shape-triggered failure can still slip under this
+/// line, and burst below it is best-effort, not guaranteed. The guardrail only
+/// catches the clearly-oversized case and steers it to the deterministic atomic
+/// bracketed-paste path (`--paste-input`), which is the correct delivery
+/// mechanism for any large prompt. 4096 is a deliberately round, conservative
+/// value (~one tty buffer) sitting above the single-line instructions the burst
+/// path was designed for; it was chosen as a precaution, not bisected from a
+/// pass/fail sweep. See issue #60.
+pub(crate) const BURST_MAX_BYTES: usize = 4096;
 
 /// Orchestrates an interactive Target CLI inside a PTY.
 pub struct Wrapper {
@@ -355,6 +373,26 @@ impl Wrapper {
             .bytes()
             .map(|b| if b == b'\n' { b'\r' } else { b })
             .collect();
+        // Conservative guardrail: refuse the clearly-oversized case loudly rather
+        // than risk silently mis-delivering it. Burst delivery of large prompts is
+        // best-effort and its #60 failure mode is shape-dependent (not purely
+        // size-bound), so this is a precautionary policy line, not a proven
+        // boundary — it redirects big prompts to the deterministic `--paste-input`
+        // path. `body.len()` is the post-fold, post-newline-translation byte count
+        // actually headed for the PTY, so the reported figure can exceed the raw
+        // input length after `--wrap-input` folding.
+        if body.len() > BURST_MAX_BYTES {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "--no-jitter burst delivery is not reliable for large prompts; \
+                     it is capped at {BURST_MAX_BYTES} bytes as a precaution \
+                     (got {} bytes after any --wrap-input folding). \
+                     Use --paste-input for large prompts.",
+                    body.len()
+                ),
+            )));
+        }
         let mut offset = 0;
         while offset < body.len() {
             let end = (offset + CHUNK).min(body.len());
@@ -823,6 +861,91 @@ mod tests {
             start.elapsed() < Duration::from_secs(10),
             "burst input was not fast, took {:?}",
             start.elapsed()
+        );
+    }
+
+    /// Assemble a realistic multi-section audit prompt (instruction + audit
+    /// notes + code) whose delivered size exceeds `target` bytes. This is the
+    /// mixed-structure shape that triggers #60's mis-delivery, as opposed to a
+    /// monolithic `"x".repeat(_)`.
+    fn multisection_prompt(target: usize) -> String {
+        let instruction = "You are a security auditor. Review the contract below and \
+            report reentrancy, integer-overflow, and access-control findings as a \
+            numbered list, each with a one-line justification.\n\n";
+        let audit_note = "- prior finding: unchecked external call in withdraw()\n\
+            - prior finding: missing onlyOwner modifier on setFeeRecipient()\n\
+            - prior finding: rounding loss in convertToShares() truncates dust\n";
+        let code = "\n```solidity\ncontract Vault {\n    mapping(address => uint256) bal;\n    function withdraw(uint256 amt) external {\n        (bool ok,) = msg.sender.call{value: amt}(\"\");\n        require(ok, \"transfer failed\");\n        bal[msg.sender] -= amt;\n    }\n}\n```\n";
+        let mut prompt = String::from(instruction);
+        prompt.push_str("Audit notes:\n");
+        while prompt.len() < target {
+            prompt.push_str(audit_note);
+        }
+        prompt.push_str(code);
+        prompt
+    }
+
+    #[test]
+    fn send_burst_rejects_oversized_input_loudly() {
+        // A clearly-oversized burst body is refused with the remedy named,
+        // rather than sent into #60's silent mis-delivery.
+        let config = WrapperConfig {
+            burst_input: true,
+            ..WrapperConfig::default()
+        };
+        // The guard returns before any PTY write, so the target only needs to
+        // exist; a live `sleep` keeps the slave open for symmetry with the
+        // accept test below (dropping `w` SIGKILLs it).
+        let mut w = wrapper("sh", &["-c", "sleep 5"], config);
+        let err = w
+            .send(&"x".repeat(BURST_MAX_BYTES + 1))
+            .expect_err("oversized burst input must be rejected");
+        assert!(
+            err.to_string().contains("--paste-input"),
+            "the error must name the remedy; got: {err}"
+        );
+    }
+
+    #[test]
+    fn send_burst_accepts_input_at_the_ceiling() {
+        // Exactly `BURST_MAX_BYTES` is still delivered (the bound is inclusive):
+        // pins the guard is off-by-one-correct, not an over-eager `>=`. A live
+        // target keeps the PTY slave open so the burst writes succeed.
+        let config = WrapperConfig {
+            burst_input: true,
+            ..WrapperConfig::default()
+        };
+        let mut w = wrapper("sh", &["-c", "sleep 5"], config);
+        w.send(&"x".repeat(BURST_MAX_BYTES))
+            .expect("input at the ceiling must be accepted");
+    }
+
+    #[test]
+    fn send_burst_rejects_an_oversized_multisection_prompt() {
+        // Probe the guardrail with the realistic multi-section shape that
+        // triggers #60 (instruction + audit notes + code), not just a monolithic
+        // `"x".repeat`. Sized past the guardrail it must be refused loudly with
+        // the remedy named. NOTE: this does not prove the shape-dependent failure
+        // is fully covered — a sub-guardrail instance can still slip through
+        // (see `BURST_MAX_BYTES`); it pins that the guard fires on realistic
+        // structured input, not only on a repeated-byte payload.
+        let prompt = multisection_prompt(BURST_MAX_BYTES + 256);
+        assert!(
+            prompt.len() > BURST_MAX_BYTES,
+            "the test prompt must exceed the guardrail; len={}",
+            prompt.len()
+        );
+        let config = WrapperConfig {
+            burst_input: true,
+            ..WrapperConfig::default()
+        };
+        let mut w = wrapper("sh", &["-c", "sleep 5"], config);
+        let err = w
+            .send(&prompt)
+            .expect_err("an oversized multi-section prompt must be rejected");
+        assert!(
+            err.to_string().contains("--paste-input"),
+            "the error must name the remedy; got: {err}"
         );
     }
 
