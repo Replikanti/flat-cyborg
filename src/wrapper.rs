@@ -79,16 +79,11 @@ pub struct WrapperConfig {
     /// fold introduces newlines, and only the burst path translates them to the
     /// `\r` an Enter-submits editor needs without firing early.
     pub wrap_input: usize,
-    /// Optional transcript needle that gates IDLE: while set, [`Output::Idle`]
-    /// silence is ignored until a line equal to this string (trimmed) has
-    /// appeared in the transcript. `None` (the default) disables the gate.
-    ///
-    /// Used by `--extract` to hold off completion until the model's closing
-    /// sentinel marker has been emitted — a model that emits startup chrome and
-    /// then pauses to think must not have that pause mistaken for a finished
-    /// (empty) reply. The watchdog (`exec_timeout`) remains the backstop if the
-    /// needle never appears.
-    pub idle_gate: Option<String>,
+    /// Optional sentinel gate on IDLE (see [`IdleGate`]): while set,
+    /// [`Output::Idle`] silence is ignored until the gate needle has appeared as
+    /// its own line in the transcript, or the gate's marker-less grace has
+    /// elapsed. `None` (the default) disables the gate.
+    pub idle_gate: Option<IdleGate>,
     /// Bracketed-paste input (the `--paste-input` flag): wrap the whole command
     /// body in `ESC[200~`/`ESC[201~` and write it in one shot, then submit with a
     /// settled, separate `\r`. An editor in bracketed-paste mode (claude/codex
@@ -120,6 +115,35 @@ impl Default for WrapperConfig {
             paste_input: false,
         }
     }
+}
+
+/// The sentinel gate on IDLE ([`WrapperConfig::idle_gate`]).
+///
+/// Used by `--extract` to hold off completion until the model's closing
+/// sentinel marker has been emitted — a model that emits startup chrome and
+/// then pauses to think must not have that pause mistaken for a finished
+/// (empty) reply. The needle is matched as a whole (trimmed) transcript line,
+/// so the marker named mid-sentence inside the echoed wrap instruction does not
+/// open the gate.
+///
+/// The needle and its grace live in ONE field on purpose: [`Wrapper::run_command`]
+/// `take()`s the gate for the pre-typing readiness wait and restores it
+/// afterwards (the closing marker cannot exist before the prompt is even typed),
+/// and the grace must be suspended by that same `take()` — otherwise every
+/// command would pay the grace before it is delivered.
+#[derive(Debug, Clone)]
+pub struct IdleGate {
+    /// The transcript line that opens the gate (the model's closing marker).
+    pub needle: String,
+    /// How long the output must stay *continuously* quiet before a settled
+    /// screen is accepted as IDLE even though the needle never appeared.
+    ///
+    /// `None` (sentinel-strict) means the needle is the only completion signal
+    /// and the watchdog (`exec_timeout`) is the backstop. `Some(grace)` demotes
+    /// the settled screen to a bounded fallback: marker-first (instant), and a
+    /// marker-less reply still completes once the screen has been quiet for
+    /// `grace`. `Some(Duration::ZERO)` restores pure settle-based completion.
+    pub markerless_grace: Option<Duration>,
 }
 
 /// The Target CLI's lifecycle state, as classified from the sanitized stream.
@@ -229,18 +253,34 @@ impl Wrapper {
     /// when no gate is configured, or when the gate needle has appeared as its
     /// own (trimmed) line in the transcript. The transcript is the screen's full
     /// text in TUI mode and the sanitized line log otherwise.
-    fn idle_gate_open(&self) -> bool {
+    ///
+    /// Public so a caller can tell a run that completed on the closing sentinel
+    /// from one that fell back to the marker-less grace.
+    pub fn idle_gate_open(&self) -> bool {
         match &self.config.idle_gate {
             None => true,
-            Some(needle) => {
+            Some(gate) => {
                 let hay = if self.config.tui {
                     self.screen_full_text()
                 } else {
                     self.sanitizer.clean_log()
                 };
-                transcript_has_line(&hay, needle)
+                transcript_has_line(&hay, &gate.needle)
             }
         }
+    }
+
+    /// Whether the gate's marker-less grace ([`IdleGate::markerless_grace`]) has
+    /// elapsed since the last *content* change, i.e. whether a settled screen
+    /// may be accepted as IDLE without the closing marker. Always `false` for a
+    /// sentinel-strict gate (`markerless_grace: None`).
+    fn markerless_grace_expired(&self, last_activity: Instant) -> bool {
+        let grace = self
+            .config
+            .idle_gate
+            .as_ref()
+            .and_then(|gate| gate.markerless_grace);
+        matches!(grace, Some(g) if last_activity.elapsed() >= g)
     }
 
     /// Mutable access to the underlying session.
@@ -264,7 +304,10 @@ impl Wrapper {
             // complete — the wait would burn the whole watchdog and `send()`
             // below would never run, so the prompt is never delivered and the
             // reply is empty. The gate belongs only to the post-typing reply
-            // wait. Disable it for the readiness wait, then restore it.
+            // wait. Disable it for the readiness wait, then restore it. Taking
+            // the whole gate also suspends its marker-less grace, so the
+            // readiness wait still completes on the first settled screen instead
+            // of paying the grace before the prompt is even delivered.
             let saved_gate = self.config.idle_gate.take();
             let ready = self.wait_until_idle();
             self.config.idle_gate = saved_gate;
@@ -557,7 +600,16 @@ impl Wrapper {
                         // The sentinel-aware gate (when set) holds off IDLE until
                         // the model has actually emitted its closing marker, so a
                         // mid-think pause is not mistaken for a finished reply.
-                        if idle && self.idle_gate_open() {
+                        // A gate carrying a marker-less grace demotes the settled
+                        // screen to a BOUNDED fallback instead of disabling the
+                        // gate outright: a model that omits the marker still
+                        // completes, but only after the output has been quiet for
+                        // the whole grace — far longer than `idle_silence`, so a
+                        // think-pause no longer ends the reply wait.
+                        if idle
+                            && (self.idle_gate_open()
+                                || self.markerless_grace_expired(last_activity))
+                        {
                             self.state = State::Idle;
                             return Ok(Outcome::Idle);
                         }
@@ -767,6 +819,153 @@ mod tests {
             w.clean_log()
         );
         // Dropping `w` SIGKILLs the lingering `sleep 30`.
+    }
+
+    /// The `--extract` shape: grid capture, a short idle window, and a sentinel
+    /// gate carrying `grace`. `sh` stands in for the model here; the closing
+    /// marker is just a line the "model" does or does not print.
+    fn gated_config(grace: Option<Duration>, exec_timeout: Duration) -> WrapperConfig {
+        WrapperConfig {
+            tui: true,
+            idle_silence: Duration::from_millis(250),
+            exec_timeout,
+            poll_interval: Duration::from_millis(50),
+            idle_gate: Some(IdleGate {
+                needle: "FCB_T_END".to_string(),
+                markerless_grace: grace,
+            }),
+            ..WrapperConfig::default()
+        }
+    }
+
+    #[test]
+    fn gate_holds_through_a_think_pause_and_completes_on_the_marker() {
+        // THE regression this gate exists for: the model emits some chrome, goes
+        // quiet for far longer than `idle_silence` while it thinks, and only then
+        // writes its reply + closing marker. A settle-only completion returns
+        // during that pause and captures a screen without the answer. With the
+        // gate the wrapper must sit through the pause and complete the moment the
+        // marker lands — promptly, not on the grace.
+        let mut w = wrapper(
+            "sh",
+            &[
+                "-c",
+                "printf 'thinking\\n'; sleep 1.5; printf 'FCB_T_END\\n'; sleep 30",
+            ],
+            gated_config(Some(Duration::from_secs(8)), Duration::from_secs(30)),
+        );
+
+        let start = Instant::now();
+        let outcome = w.wait_until_idle().expect("wait");
+        let elapsed = start.elapsed();
+        assert_eq!(outcome, Outcome::Idle);
+        assert!(
+            elapsed >= Duration::from_millis(1200),
+            "returned during the think pause (settle-only completion): {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "did not complete on the marker (waited for the grace?): {elapsed:?}"
+        );
+        assert!(
+            w.screen_full_text().contains("FCB_T_END"),
+            "the marker must be on the captured screen; screen: {:?}",
+            w.screen_full_text()
+        );
+    }
+
+    #[test]
+    fn markerless_grace_completes_a_reply_without_the_marker() {
+        // The model never emits the closing marker (claude intermittently refuses
+        // the wrap protocol). The run must still complete — once the screen has
+        // been quiet for the grace — instead of burning the whole watchdog (#55).
+        let mut w = wrapper(
+            "sh",
+            &["-c", "printf 'unfenced answer\\n'; sleep 30"],
+            gated_config(Some(Duration::from_millis(1500)), Duration::from_secs(20)),
+        );
+
+        let start = Instant::now();
+        let outcome = w.wait_until_idle().expect("wait");
+        let elapsed = start.elapsed();
+        assert_eq!(outcome, Outcome::Idle);
+        assert!(
+            elapsed >= Duration::from_millis(1200),
+            "completed on `idle_silence`, not on the grace: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the grace did not fire well before the watchdog: {elapsed:?}"
+        );
+        assert!(!w.idle_gate_open(), "the gate must NOT report a marker");
+    }
+
+    #[test]
+    fn strict_gate_without_a_grace_rides_to_the_watchdog() {
+        // Strict `--extract` is unchanged: with no grace the marker is the only
+        // completion signal and a marker-less run ends on the watchdog.
+        let mut config = gated_config(None, Duration::from_millis(700));
+        config.interrupt_grace = Duration::from_secs(2);
+        let mut w = wrapper(
+            "sh",
+            &["-c", "printf 'unfenced answer\\n'; sleep 30"],
+            config,
+        );
+
+        let start = Instant::now();
+        let outcome = w.wait_until_idle().expect("wait");
+        let elapsed = start.elapsed();
+        assert_eq!(outcome, Outcome::TimedOut);
+        assert!(
+            elapsed >= Duration::from_millis(600),
+            "returned before the watchdog: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "watchdog late: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn zero_grace_matches_ungated_settle_completion() {
+        // `--extract-grace-ms 0` is the operator escape hatch and the A/B control
+        // arm: a settled screen is accepted immediately, exactly like the ungated
+        // (pre-0.13.0 `--extract-structural`) behaviour. Run both and compare.
+        // (The marker fast-path stays armed under a zero grace; it can only
+        // complete EARLIER, on the same fenced reply.)
+        let script = "printf 'unfenced answer\\n'; sleep 30";
+
+        let mut ungated = wrapper(
+            "sh",
+            &["-c", script],
+            WrapperConfig {
+                idle_gate: None,
+                ..gated_config(None, Duration::from_secs(20))
+            },
+        );
+        let start = Instant::now();
+        assert_eq!(ungated.wait_until_idle().expect("wait"), Outcome::Idle);
+        let ungated_elapsed = start.elapsed();
+
+        let mut zero_grace = wrapper(
+            "sh",
+            &["-c", script],
+            gated_config(Some(Duration::ZERO), Duration::from_secs(20)),
+        );
+        let start = Instant::now();
+        assert_eq!(zero_grace.wait_until_idle().expect("wait"), Outcome::Idle);
+        let zero_elapsed = start.elapsed();
+
+        // Both complete on the first settled screen (a small multiple of
+        // `idle_silence`), so neither pays a grace; the bound is wide for CI.
+        assert!(
+            ungated_elapsed < Duration::from_secs(5),
+            "ungated settle completion regressed: {ungated_elapsed:?}"
+        );
+        assert!(
+            zero_elapsed < Duration::from_secs(5),
+            "a zero grace must not delay settle completion: {zero_elapsed:?}"
+        );
     }
 
     #[test]

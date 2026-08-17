@@ -238,3 +238,69 @@ fn extract_without_markers_warns_and_prints_nothing() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn extract_grace_ms_rejects_a_non_numeric_value() {
+    // A bad --extract-grace-ms is a usage error: exit 2, naming the flag.
+    let out = Command::new(bin())
+        .args(["--extract-grace-ms", "soon", "--", "sh", "-c", "true"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run with a bad --extract-grace-ms");
+    assert_eq!(out.status.code(), Some(2), "expected usage exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid --extract-grace-ms"),
+        "stderr: {stderr:?}"
+    );
+}
+
+#[test]
+fn extract_grace_ms_zero_completes_on_a_settled_screen() {
+    // `--extract-grace-ms 0` is the escape hatch: it restores the pre-0.13.0
+    // `--extract-structural` behaviour where a settled screen completes the run
+    // at once. The target prints one line and then sleeps forever without ever
+    // emitting the closing marker, so:
+    //   * the run must finish on the settled screen (not on the watchdog: no 124),
+    //   * far faster than the default grace would allow — with --idle-ms 300 and
+    //     --timeout-ms 60000 the default is min(max(4x300ms, 30s), 30s) = 30s, so
+    //     finishing well under that can only be the zero grace (the bound is
+    //     deliberately loose for CI jitter),
+    //   * and the marker-less completion must be reported on stderr.
+    // --no-jitter keeps the typing itself out of the measured time.
+    use std::time::Instant;
+    let start = Instant::now();
+    let out = Command::new(bin())
+        .args([
+            "--extract-structural",
+            "--extract-grace-ms",
+            "0",
+            "--no-jitter",
+            "--idle-ms",
+            "300",
+            "--timeout-ms",
+            "60000",
+            "--cmd",
+            "ping",
+            "--",
+            "sh",
+            "-c",
+            "printf 'hello\\n'; sleep 30",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run with --extract-grace-ms 0");
+    let elapsed = start.elapsed();
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "a zero grace must complete on the settled screen, took {elapsed:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("marker-less grace (0 ms)"),
+        "expected the marker-less completion diagnostic, stderr: {stderr:?}"
+    );
+    // `sh` is not a known CLI, so nothing is scraped: stdout stays empty.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
