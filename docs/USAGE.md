@@ -85,7 +85,7 @@ flat-cyborg picks a mode automatically:
 | `--auto-approve` | Auto-confirm agent **approval / trust menus** — the arrow-key numbered menus that agentic CLIs show for actions the `[y/n]` auto-confirm cannot answer (e.g. codex's `git push` confirmation, claude's "trust this folder" prompt) — by pressing Enter on the default "yes/proceed/trust" option. **Bypasses the agent's own safety gates (including for destructive actions), so it is opt-in and off by default.** |
 | `--extract` | The reply-extraction mechanism (see below): wraps each `--cmd` so the target fences its reply between unique per-run markers and prints only the fenced reply. **Sentinel-strict by default** — if the markers aren't found it prints nothing and warns, so a malformed/refusal reply is empty downstream, never UI chrome. Requires `--cmd`. |
 | `--extract-structural` | Opt-in (implies `--extract`): when the markers are absent, fall back to a best-effort, chrome-filtered structural scrape of a known CLI's (claude/codex) screen. Off by default because on a refusal the scrape can return echoed-prompt prose that no chrome filter catches — prefer the strict default for programmatic capture. Completion stays gated on the closing marker; a marker-less reply completes once the output has been quiet for `--extract-grace-ms`. |
-| `--extract-grace-ms <MS>` | How long the output must be **continuously quiet** before a reply *without* the closing marker is accepted as finished. With `--extract-structural` the default is `min(max(4 × --idle-ms, 30000), --timeout-ms / 2)` — a 30 s floor, scaled up for a driver that already expects long silences, and always capped below the watchdog so the fallback fires before a `124`. `0` completes on the first settled screen (the pre-0.13.0 `--extract-structural` behavior); strict `--extract` has no grace unless this flag sets one. |
+| `--extract-grace-ms <MS>` | How long the output must be **continuously quiet** before a reply *without* the closing marker is accepted as finished. With `--extract-structural` the default is `min(max(4 × --idle-ms, 30000), --timeout-ms / 2)` — a 30 s floor, scaled up for a driver that already expects long silences, and kept well inside the watchdog budget. Whatever the value, a settled screen is accepted at the latest in the final `--idle-ms` before `--timeout-ms`, so waiting for the marker never costs a `124`. `0` completes on the first settled screen (the pre-0.13.0 `--extract-structural` behavior); strict `--extract` has no grace unless this flag sets one. |
 | `--tui` | Full-screen TUI mode (see below). |
 | `--no-jitter` | Write each `--cmd` as a fast chunked burst instead of one human-cadenced keystroke at a time (40-300 ms each — minutes for a multi-thousand-char prompt). Use for programmatic LLM drivers where the anti-anomaly typing cadence is not wanted. Best-effort for large prompts only: as a precaution it errors out above a conservative size guardrail (a policy line, not a proven boundary; measured *after* `--wrap-input` folding) and directs you to `--paste-input`, which delivers large prompts deterministically. |
 | `--wrap-input <COLS>` | Soft-fold each input line to at most `COLS` columns at word boundaries before sending (default `0` = off). An ultra-long *single* line overflows an Ink-style editor's input field so the prompt is never delivered whole; folding it (the model reads the wrapped text identically) makes a large prompt land reliably. Pairs with `--no-jitter` — but for large prompts prefer `--paste-input`, which needs no folding and is not size-capped. (Folding inserts line breaks, so it *grows* the byte count the `--no-jitter` size guardrail measures.) |
@@ -186,8 +186,14 @@ completes, but only after the output has been continuously quiet for
   `min(max(4 × --idle-ms, 30000), --timeout-ms / 2)`. The 30 s floor is the
   quiet window a large model actually needs; the `4 ×` term honors a driver
   that already tells us to expect long silences (`--idle-ms 12000` → 48 s);
-  the `--timeout-ms / 2` cap keeps the fallback strictly ahead of the watchdog,
-  so this can never turn a completed run into exit `124`.
+  the `--timeout-ms / 2` cap keeps the grace well inside the watchdog budget so
+  a marker-less reply normally completes on quiet rather than on the deadline.
+- **The grace never costs you a timeout.** It is measured from the last change
+  on screen, so a reply whose final chunk lands late has less than a full grace
+  of budget left; rather than sit on a good settled screen until the watchdog
+  fires, flat-cyborg accepts it in the final `--idle-ms` before `--timeout-ms`.
+  That holds for any value, including an explicit `--extract-grace-ms` longer
+  than the whole timeout.
 - Strict `--extract` has no grace unless you pass one: with no structural
   fallback there is nothing to recover from a marker-less run anyway, and the
   watchdog is the backstop.
@@ -323,7 +329,7 @@ back to `sudo` if the install directory is not writable).
 |---------|--------------------|
 | Exit `124`, no output | The target never reached idle. Raise `--idle-ms` and/or `--timeout-ms`; for a full-screen TUI add `--tui`. |
 | `--tui` capture is full of UI chrome | Add `--extract` (with `--cmd`) to print only the model's fenced reply. |
-| `--extract` output is empty or looks like chrome on a slow model | The reply was captured before the model finished. Do **not** raise `--idle-ms`: completion is gated on the closing marker, so check stderr for `completed on the marker-less grace` — if it is there, the target never rendered the marker on its own line; if the run ended in `124`, raise `--timeout-ms` (the grace is capped at half of it). |
+| `--extract` output is empty or looks like chrome on a slow model | The reply was captured before the model finished. Do **not** raise `--idle-ms`: completion is gated on the closing marker, so check stderr for `completed on the marker-less grace` — if it is there, the target never rendered the marker on its own line. A `124` here means the screen never settled at all (a continuously animated UI), not that the grace was too long: raise `--timeout-ms`. |
 | LLM CLI stuck on a "trust this folder" screen | The menu is arrow-key driven, so the `[y/n]` auto-confirm cannot answer it. Run the CLI in a directory it already trusts, or pass `--auto-approve` to confirm the trust menu (it bypasses the agent's safety gate, so use deliberately). |
 | Agent stalls on an approval menu (codex `git push`, etc.) | Pass `--auto-approve` to auto-confirm agent approval/trust menus. **It bypasses the agent's safety gates** (including destructive actions); alternatively run the agent in a pre-trusted dir or a mode that does not prompt. |
 | Target says "not a git repository" / acts on the wrong directory | flat-cyborg inherits its own working directory by default, so an agent launched from a parent dir sees the wrong CWD. Point the target explicitly with `--cwd <repo>`. |

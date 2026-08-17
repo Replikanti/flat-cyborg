@@ -195,6 +195,10 @@ pub struct Wrapper {
     jitter: Jitter,
     config: WrapperConfig,
     state: State,
+    /// Needle occurrences already in the transcript when the IDLE gate was armed
+    /// for the current command; the gate opens only above this count. See
+    /// [`Wrapper::arm_idle_gate`].
+    gate_baseline_hits: usize,
 }
 
 impl Wrapper {
@@ -215,6 +219,7 @@ impl Wrapper {
             jitter: Jitter::new(),
             config,
             state: State::Running,
+            gate_baseline_hits: 0,
         }
     }
 
@@ -249,38 +254,92 @@ impl Wrapper {
             .unwrap_or_default()
     }
 
+    /// The transcript the IDLE gate reads: the screen's full text (scrollback
+    /// included) in TUI mode, the sanitized line log otherwise.
+    fn transcript(&self) -> String {
+        if self.config.tui {
+            self.screen_full_text()
+        } else {
+            self.sanitizer.clean_log()
+        }
+    }
+
+    /// How many transcript lines currently equal the gate needle (0 when no gate
+    /// is configured).
+    fn gate_hits(&self) -> usize {
+        match &self.config.idle_gate {
+            None => 0,
+            Some(gate) => transcript_line_hits(&self.transcript(), &gate.needle),
+        }
+    }
+
     /// Whether the IDLE gate ([`WrapperConfig::idle_gate`]) is satisfied: `true`
-    /// when no gate is configured, or when the gate needle has appeared as its
-    /// own (trimmed) line in the transcript. The transcript is the screen's full
-    /// text in TUI mode and the sanitized line log otherwise.
+    /// when no gate is configured, or when the needle has appeared as its own
+    /// (trimmed) transcript line *since the gate was armed* (see
+    /// [`Self::arm_idle_gate`]).
     ///
     /// Public so a caller can tell a run that completed on the closing sentinel
     /// from one that fell back to the marker-less grace.
     pub fn idle_gate_open(&self) -> bool {
         match &self.config.idle_gate {
             None => true,
-            Some(gate) => {
-                let hay = if self.config.tui {
-                    self.screen_full_text()
-                } else {
-                    self.sanitizer.clean_log()
-                };
-                transcript_has_line(&hay, &gate.needle)
-            }
+            Some(_) => self.gate_hits() > self.gate_baseline_hits,
         }
     }
 
-    /// Whether the gate's marker-less grace ([`IdleGate::markerless_grace`]) has
-    /// elapsed since the last *content* change, i.e. whether a settled screen
-    /// may be accepted as IDLE without the closing marker. Always `false` for a
-    /// sentinel-strict gate (`markerless_grace: None`).
-    fn markerless_grace_expired(&self, last_activity: Instant) -> bool {
-        let grace = self
+    /// Arms the IDLE gate for a new command: the needle lines already in the
+    /// transcript belong to EARLIER commands, so the gate must require a NEW one.
+    ///
+    /// Without this, a second [`Self::run_command`] with the same needle starts
+    /// with the gate already open and its reply wait completes on the first
+    /// settled screen — before the second answer exists. Called automatically by
+    /// [`Self::run_command`]; call it directly when driving
+    /// [`Self::wait_until_idle`] once per command.
+    ///
+    /// Best-effort, and deliberately so: the baseline is an occurrence COUNT (a
+    /// line offset would be invalidated by every erase-display, alt-screen switch
+    /// and scrollback eviction), and a repainting emulator can drop and re-render
+    /// the same marker within a single read, which the count cannot see. The
+    /// robust arrangement is a needle that is unique per command — which is what
+    /// the `--extract` CLI does, generating a fresh sentinel pair for every
+    /// `--cmd`. Where the needle repeats, a miss costs the marker-less grace, not
+    /// a wrong answer.
+    pub fn arm_idle_gate(&mut self) {
+        self.gate_baseline_hits = self.gate_hits();
+    }
+
+    /// Replaces the IDLE gate ([`WrapperConfig::idle_gate`]) between commands —
+    /// the `--extract` CLI uses it to install each command's own sentinel needle.
+    pub fn set_idle_gate(&mut self, gate: Option<IdleGate>) {
+        self.config.idle_gate = gate;
+        self.gate_baseline_hits = 0;
+    }
+
+    /// Whether a settled screen may be accepted as IDLE even though the closing
+    /// marker never appeared. Always `false` for a sentinel-strict gate
+    /// (`markerless_grace: None`) — there the marker is the only signal.
+    ///
+    /// Two ways to qualify:
+    /// - the output has been quiet for the whole grace (the normal path), or
+    /// - the watchdog is about to fire and the screen is settled *now*. The grace
+    ///   is measured from the last content change, not from the start of the
+    ///   wait, so a reply whose last chunk lands late leaves less than a full
+    ///   grace of budget; without this the wrapper would sit on a perfectly good
+    ///   settled screen and exit `124` instead — exactly the failure #55 fixed.
+    ///   This bound makes "a marker-less reply that settles is never converted
+    ///   into a timeout" true for ANY grace value, including an explicit
+    ///   `--extract-grace-ms` larger than the whole timeout.
+    fn markerless_settle_allowed(&self, start: Instant, last_activity: Instant) -> bool {
+        let Some(grace) = self
             .config
             .idle_gate
             .as_ref()
-            .and_then(|gate| gate.markerless_grace);
-        matches!(grace, Some(g) if last_activity.elapsed() >= g)
+            .and_then(|gate| gate.markerless_grace)
+        else {
+            return false;
+        };
+        last_activity.elapsed() >= grace
+            || start.elapsed() + self.config.idle_silence >= self.config.exec_timeout
     }
 
     /// Mutable access to the underlying session.
@@ -316,6 +375,13 @@ impl Wrapper {
                 other => return Ok(other),
             }
         }
+        // Require a NEW closing marker for THIS command: any needle already in
+        // the transcript was emitted by an earlier one (the sentinel pair is
+        // per-run, not per-command) and would otherwise leave the gate open
+        // before the reply even starts. Armed after the readiness wait and
+        // before typing — the echoed wrap instruction names the marker only
+        // mid-sentence, and the gate matches whole lines.
+        self.arm_idle_gate();
         self.send(command)?;
         self.wait_until_idle()
     }
@@ -605,10 +671,12 @@ impl Wrapper {
                         // gate outright: a model that omits the marker still
                         // completes, but only after the output has been quiet for
                         // the whole grace — far longer than `idle_silence`, so a
-                        // think-pause no longer ends the reply wait.
+                        // think-pause no longer ends the reply wait. The fallback
+                        // also fires on the last of the watchdog budget, so it
+                        // never costs a settled screen a `124`.
                         if idle
                             && (self.idle_gate_open()
-                                || self.markerless_grace_expired(last_activity))
+                                || self.markerless_settle_allowed(start, last_activity))
                         {
                             self.state = State::Idle;
                             return Ok(Outcome::Idle);
@@ -627,13 +695,16 @@ impl Wrapper {
     }
 }
 
-/// True if any line of `hay`, trimmed, equals `needle`. The gate matches a
-/// standalone line (not a substring) so the marker named *inside* the echoed
-/// wrap instruction — where it sits mid-sentence — does not satisfy the gate;
-/// only the model emitting the marker on its own line does.
-pub(crate) fn transcript_has_line(hay: &str, needle: &str) -> bool {
+/// How many lines of `hay`, trimmed, equal `needle`.
+///
+/// The gate matches a standalone line (not a substring) so the marker named
+/// *inside* the echoed wrap instruction — where it sits mid-sentence — does not
+/// satisfy it; only the model emitting the marker on its own line does. It
+/// counts rather than merely detects so the gate can require a marker emitted
+/// for the CURRENT command: see [`Wrapper::arm_idle_gate`].
+pub(crate) fn transcript_line_hits(hay: &str, needle: &str) -> usize {
     let needle = needle.trim();
-    hay.lines().any(|l| l.trim() == needle)
+    hay.lines().filter(|l| l.trim() == needle).count()
 }
 
 /// Soft-folds `text` so no line exceeds `width` columns, breaking at the last
@@ -898,6 +969,145 @@ mod tests {
             "the grace did not fire well before the watchdog: {elapsed:?}"
         );
         assert!(!w.idle_gate_open(), "the gate must NOT report a marker");
+    }
+
+    #[test]
+    fn markerless_settle_is_accepted_on_the_last_of_the_budget() {
+        // Regression: the grace is measured from the LAST content change, so a
+        // reply whose final chunk lands late has less than a full grace of
+        // watchdog budget left. Capping the grace VALUE at `exec_timeout / 2`
+        // does not bound that wait — here the last output lands at ~4 s with a
+        // 5 s grace and a 6 s watchdog, so waiting the grace out would exit 124
+        // on a perfectly good settled screen (the #55 failure, restored). The
+        // settled screen must be accepted on the last of the budget instead.
+        // (A 1 s idle window leaves a full second between the budget bound at
+        // `exec_timeout - idle_silence` = 5 s and the watchdog at 6 s, so CI
+        // jitter cannot flip the outcome.)
+        let mut w = wrapper(
+            "sh",
+            &[
+                "-c",
+                "printf 'first chunk\\n'; sleep 3; printf 'late chunk\\n'; sleep 60",
+            ],
+            WrapperConfig {
+                idle_silence: Duration::from_secs(1),
+                ..gated_config(Some(Duration::from_secs(5)), Duration::from_secs(6))
+            },
+        );
+
+        let start = Instant::now();
+        let outcome = w.wait_until_idle().expect("wait");
+        let elapsed = start.elapsed();
+        assert_eq!(
+            outcome,
+            Outcome::Idle,
+            "a settled screen must never be turned into a timeout by the grace"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(3),
+            "the gate did not hold through the pause before the late chunk: {elapsed:?}"
+        );
+        assert!(
+            w.screen_full_text().contains("late chunk"),
+            "the late chunk must be in the capture; screen: {:?}",
+            w.screen_full_text()
+        );
+    }
+
+    #[test]
+    fn an_oversized_explicit_grace_still_completes() {
+        // `--extract-grace-ms` is not clamped at parse time: a caller can ask for
+        // a grace longer than the whole timeout. The budget bound must still
+        // complete the run on the settled screen rather than exit 124.
+        let mut w = wrapper(
+            "sh",
+            &["-c", "printf 'unfenced answer\\n'; sleep 60"],
+            WrapperConfig {
+                idle_silence: Duration::from_secs(1),
+                ..gated_config(Some(Duration::from_secs(600)), Duration::from_secs(4))
+            },
+        );
+
+        let start = Instant::now();
+        let outcome = w.wait_until_idle().expect("wait");
+        let elapsed = start.elapsed();
+        assert_eq!(outcome, Outcome::Idle);
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "must complete before the watchdog, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_marker_does_not_open_the_gate_for_the_next_command() {
+        // Multi-command regression: the sentinel pair is per-RUN, so command A's
+        // closing marker is still in the transcript when command B's reply wait
+        // starts. If it counted, B's gate would be open before B answered and the
+        // wait would end on the first settled screen — worse than the settle-only
+        // behaviour it replaced. Arming the gate must require a NEW marker.
+        //
+        // The "model" prints its marker straight away (command A), then pauses
+        // and prints an unfenced second answer (command B).
+        let mut w = wrapper(
+            "sh",
+            &[
+                "-c",
+                "printf 'FCB_T_END\\n'; sleep 2; printf 'second answer\\n'; sleep 60",
+            ],
+            gated_config(Some(Duration::from_millis(1500)), Duration::from_secs(20)),
+        );
+
+        // Command A completes on its marker.
+        let first = w.wait_until_idle().expect("first wait");
+        assert_eq!(first, Outcome::Idle);
+        assert!(w.idle_gate_open(), "A must complete on its own marker");
+
+        // Command B: re-arm (what `run_command` does per command) and wait.
+        w.arm_idle_gate();
+        assert!(
+            !w.idle_gate_open(),
+            "A's marker must not leave the gate open for B"
+        );
+        let start = Instant::now();
+        let second = w.wait_until_idle().expect("second wait");
+        let elapsed = start.elapsed();
+        assert_eq!(second, Outcome::Idle);
+        assert!(
+            elapsed >= Duration::from_millis(1400),
+            "B completed on A's stale marker (before its own answer existed): {elapsed:?}"
+        );
+        assert!(
+            w.screen_full_text().contains("second answer"),
+            "B's answer must be in the capture; screen: {:?}",
+            w.screen_full_text()
+        );
+    }
+
+    #[test]
+    fn a_new_marker_reopens_the_gate_after_rearming() {
+        // The armed baseline must not blind the gate: a marker emitted for the
+        // CURRENT command opens it again, even with an identical needle already
+        // in the transcript.
+        let mut w = wrapper(
+            "sh",
+            &[
+                "-c",
+                "printf 'FCB_T_END\\n'; sleep 1; printf 'FCB_T_END\\n'; sleep 60",
+            ],
+            gated_config(Some(Duration::from_secs(30)), Duration::from_secs(20)),
+        );
+        assert_eq!(w.wait_until_idle().expect("first wait"), Outcome::Idle);
+
+        w.arm_idle_gate();
+        let start = Instant::now();
+        let second = w.wait_until_idle().expect("second wait");
+        let elapsed = start.elapsed();
+        assert_eq!(second, Outcome::Idle);
+        // Completed on the second marker (~1 s), nowhere near the 30 s grace.
+        assert!(
+            elapsed >= Duration::from_millis(700) && elapsed < Duration::from_secs(10),
+            "must complete on the NEW marker, took {elapsed:?}"
+        );
     }
 
     #[test]
@@ -1276,10 +1486,10 @@ mod tests {
         // The marker named mid-sentence in the echoed instruction must NOT open
         // the gate (otherwise the gate is satisfied before the model replies).
         let echo = "wrap your reply between FCB_abc_BEGIN and the closing marker.";
-        assert!(!transcript_has_line(echo, begin));
+        assert_eq!(transcript_line_hits(echo, begin), 0);
         // The model emitting it on its own line — even indented — opens the gate.
         let reply = "thinking…\n  FCB_abc_BEGIN\nthe answer line\n";
-        assert!(transcript_has_line(reply, begin));
+        assert_eq!(transcript_line_hits(reply, begin), 1);
     }
 
     #[test]
@@ -1294,10 +1504,10 @@ mod tests {
         // it being on its own indented line is what matters; the BEGIN marker
         // shares the `●` bullet's line and need not stand alone.
         let transcript = "● FCB_X_BEGIN\n  2+2 = 4.\n  FCB_X_END\n";
-        assert!(transcript_has_line(transcript, "FCB_X_END"));
+        assert_eq!(transcript_line_hits(transcript, "FCB_X_END"), 1);
         // The bullet-prefixed BEGIN line is not a standalone marker, and the gate
         // does not require it to be.
-        assert!(!transcript_has_line(transcript, "FCB_X_BEGIN"));
+        assert_eq!(transcript_line_hits(transcript, "FCB_X_BEGIN"), 0);
     }
 
     #[test]

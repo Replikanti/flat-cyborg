@@ -304,3 +304,38 @@ fn extract_grace_ms_zero_completes_on_a_settled_screen() {
     // `sh` is not a known CLI, so nothing is scraped: stdout stays empty.
     assert_eq!(String::from_utf8_lossy(&out.stdout), "");
 }
+
+#[test]
+fn no_grace_diagnostic_when_the_target_exits() {
+    // The marker-less diagnostic names the completion path it belongs to. A
+    // target that exits on its own never consumed the grace, so claiming it did
+    // would inflate the marker-less rate operators measure from that line.
+    let out = Command::new(bin())
+        .args([
+            "--extract-structural",
+            "--no-jitter",
+            "--idle-ms",
+            "300",
+            "--timeout-ms",
+            "20000",
+            "--cmd",
+            "ping",
+            "--",
+            "sh",
+            "-c",
+            "printf 'hi\\n'; exit 3",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run against a target that exits");
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the target's own exit code must be propagated"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("marker-less grace"),
+        "the grace diagnostic must not fire on a target that exited: {stderr:?}"
+    );
+}
