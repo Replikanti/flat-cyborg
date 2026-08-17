@@ -5,6 +5,59 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] — 2026-08-17
+
+### Added
+
+- `--extract-grace-ms <MS>` — how long the output must be continuously quiet
+  before a reply *without* the closing sentinel is accepted as finished. With
+  `--extract-structural` it defaults to
+  `min(max(4 × --idle-ms, 30000), --timeout-ms / 2)`: a 30 s floor (the quiet
+  window a large model actually needs), scaled up for a driver that already
+  expects long silences, and kept well inside the watchdog budget. Independently
+  of the value, a settled screen is accepted at the latest in the final
+  `--idle-ms` before `--timeout-ms` — the grace is measured from the last change
+  on screen, so capping it alone would not stop a late-finishing reply from
+  running into the watchdog. `0` restores the previous `--extract-structural`
+  behavior exactly — the operator escape hatch.
+- A stderr diagnostic when a run completes on that grace instead of on the
+  marker: `flat-cyborg: --extract: no closing sentinel; completed on the
+  marker-less grace (<N> ms)`, where `<N>` is how long the output had actually
+  been quiet. It separates "the model had no answer" from "we captured the
+  screen too early", which was previously indistinguishable, and is emitted only
+  when that fallback is what completed the run.
+
+### Changed
+
+- **`--extract-structural` completion is gated on the closing sentinel again**,
+  with the settled screen demoted to the bounded fallback above. Since 0.10.2 a
+  settled screen was the ONLY completion signal in structural mode, so any model
+  think-pause longer than `--idle-ms` ended the reply wait before the answer
+  existed and the structural scrape returned UI chrome or echoed prompt prose.
+  Raising `--idle-ms` only moves that line — the model already emits an
+  unambiguous "I am done" token, and it is now used again. `--idle-ms` is
+  therefore a latency knob under `--extract`, not a correctness knob. The
+  marker-less case that 0.10.2 fixed (a model omitting the sentinel) still
+  completes, and a settled screen still cannot be turned into a `124`. Strict
+  `--extract` (no `--extract-structural`) is unchanged. Fixes #68.
+
+### Fixed
+
+- Under `--extract`, a second and further `--cmd` no longer completes on the
+  *previous* command's closing marker. The sentinel pair used to be generated
+  once per run, so the earlier marker stayed in the transcript and left the gate
+  open before the next reply existed. Each `--cmd` now gets its own pair (and
+  the printed reply is the last command's), with a per-command gate arming in
+  the wrapper as a backstop for library callers that reuse a needle.
+  Single-`--cmd` runs — every current caller — are unaffected.
+- A second and further `--cmd` is no longer stranded in its pre-typing readiness
+  wait when the target is silent between replies. The readiness check asked
+  whether anything had arrived during *that* wait; a target that has just
+  answered and is sitting at its prompt has no reason to speak first, so the
+  wait burned the whole `--timeout-ms` without ever delivering the prompt and
+  the run ended `124` with an empty capture. It now asks whether the target has
+  ever rendered, which is the question it was always meant to ask.
+
 ## [0.12.1] — 2026-07-15
 
 ### Fixed

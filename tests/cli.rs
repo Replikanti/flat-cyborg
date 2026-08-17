@@ -238,3 +238,170 @@ fn extract_without_markers_warns_and_prints_nothing() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn extract_grace_ms_rejects_a_non_numeric_value() {
+    // A bad --extract-grace-ms is a usage error: exit 2, naming the flag.
+    let out = Command::new(bin())
+        .args(["--extract-grace-ms", "soon", "--", "sh", "-c", "true"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run with a bad --extract-grace-ms");
+    assert_eq!(out.status.code(), Some(2), "expected usage exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid --extract-grace-ms"),
+        "stderr: {stderr:?}"
+    );
+}
+
+#[test]
+fn extract_grace_ms_zero_completes_on_a_settled_screen() {
+    // `--extract-grace-ms 0` is the escape hatch: it restores the pre-0.13.0
+    // `--extract-structural` behaviour where a settled screen completes the run
+    // at once. The target prints one line and then sleeps forever without ever
+    // emitting the closing marker, so:
+    //   * the run must finish on the settled screen (not on the watchdog: no 124),
+    //   * far faster than the default grace would allow — with --idle-ms 300 and
+    //     --timeout-ms 60000 the default is min(max(4x300ms, 30s), 30s) = 30s, so
+    //     finishing well under that can only be the zero grace (the bound is
+    //     deliberately loose for CI jitter),
+    //   * and the marker-less completion must be reported on stderr.
+    // --no-jitter keeps the typing itself out of the measured time.
+    use std::time::Instant;
+    let start = Instant::now();
+    let out = Command::new(bin())
+        .args([
+            "--extract-structural",
+            "--extract-grace-ms",
+            "0",
+            "--no-jitter",
+            "--idle-ms",
+            "300",
+            "--timeout-ms",
+            "60000",
+            "--cmd",
+            "ping",
+            "--",
+            "sh",
+            "-c",
+            "printf 'hello\\n'; sleep 30",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run with --extract-grace-ms 0");
+    let elapsed = start.elapsed();
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "a zero grace must complete on the settled screen, took {elapsed:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The reported number is the OBSERVED quiet window (here roughly --idle-ms),
+    // not the configured grace — a grace of 0 ms is never how long the screen
+    // was actually quiet.
+    assert!(
+        stderr.contains("marker-less grace ("),
+        "expected the marker-less completion diagnostic, stderr: {stderr:?}"
+    );
+    // `sh` is not a known CLI, so nothing is scraped: stdout stays empty.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
+
+#[test]
+fn two_commands_are_both_delivered_and_the_last_reply_is_printed() {
+    // End-to-end multi-`--cmd` run, with the two completion paths in one run:
+    // the "model" prints a banner, answers the FIRST prompt without any markers
+    // (so that command completes on the marker-less grace), and answers the
+    // SECOND by fencing ANSWER between that prompt's own markers (picked out of
+    // the wrap instruction) with NOTHING after the closing one — so it completes
+    // on its sentinel and the target then goes completely silent.
+    //
+    // Two regressions meet here. That silence used to strand the next command's
+    // pre-typing readiness wait: the run ended `124` with an empty capture
+    // because the second prompt was never typed. And the marker-less report is
+    // per-wait state, so a stale one from command 1 must not be attributed to
+    // command 2 — a fenced reply reported as marker-less is a false entry in the
+    // rate operators measure from that line.
+    let out = Command::new(bin())
+        .args([
+            "--extract-structural",
+            "--no-jitter",
+            "--idle-ms",
+            "300",
+            "--extract-grace-ms",
+            "700",
+            "--timeout-ms",
+            "10000",
+            "--cmd",
+            "alpha",
+            "--cmd",
+            "bravo",
+            "--",
+            "sh",
+            "-c",
+            "n=1; printf 'banner\\n'; while read l; do \
+             if [ \"$n\" = 1 ]; then printf 'UNFENCED\\n'; else \
+             b=; e=; for w in $l; do \
+             case $w in FCB_*_BEGIN) b=$w ;; FCB_*_END) e=$w ;; esac; done; \
+             printf '%s\\nANSWER\\n%s\\n' \"$b\" \"$e\"; fi; n=$((n+1)); done",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run two commands");
+    assert!(
+        out.status.success(),
+        "multi-command run did not complete: {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("no fenced reply"),
+        "the last command's fence was not found, so it was never delivered: {stderr:?}"
+    );
+    // The run ENDED on command 2's sentinel, so it must not be reported as
+    // marker-less on account of command 1 having been.
+    assert!(
+        !stderr.contains("marker-less grace"),
+        "a fenced final reply was reported as marker-less (stale state from the \
+         earlier command): {stderr:?}"
+    );
+    // Only the LAST command's fenced reply is printed, and it is the reply
+    // itself — not chrome, not the echoed instruction, not command 1's UNFENCED.
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ANSWER");
+}
+
+#[test]
+fn no_grace_diagnostic_when_the_target_exits() {
+    // The marker-less diagnostic names the completion path it belongs to. A
+    // target that exits on its own never consumed the grace, so claiming it did
+    // would inflate the marker-less rate operators measure from that line.
+    let out = Command::new(bin())
+        .args([
+            "--extract-structural",
+            "--no-jitter",
+            "--idle-ms",
+            "300",
+            "--timeout-ms",
+            "20000",
+            "--cmd",
+            "ping",
+            "--",
+            "sh",
+            "-c",
+            "printf 'hi\\n'; exit 3",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run against a target that exits");
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the target's own exit code must be propagated"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("marker-less grace"),
+        "the grace diagnostic must not fire on a target that exited: {stderr:?}"
+    );
+}

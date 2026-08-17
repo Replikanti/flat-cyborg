@@ -32,7 +32,7 @@ pub use jitter::Jitter;
 pub use pty::PtySession;
 pub use screen::Screen;
 pub use terminal::RawModeGuard;
-pub use wrapper::{Outcome, State, Wrapper, WrapperConfig};
+pub use wrapper::{IdleGate, Outcome, State, Wrapper, WrapperConfig};
 
 /// Crate version string, sourced from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -24,7 +24,7 @@ use std::thread;
 use std::time::Duration;
 
 use flat_cyborg::pty::Output;
-use flat_cyborg::{Outcome, PtySession, RawModeGuard, Wrapper, WrapperConfig};
+use flat_cyborg::{IdleGate, Outcome, PtySession, RawModeGuard, Wrapper, WrapperConfig};
 
 mod extract;
 mod update;
@@ -73,6 +73,19 @@ OPTIONS:
                         fall back to a best-effort, chrome-filtered structural
                         scrape of a known CLI's screen. Off by default because
                         the scrape can return echoed-prompt prose on a refusal.
+                        Completion stays gated on the closing marker; a
+                        marker-less reply completes after --extract-grace-ms.
+    --extract-grace-ms <MS>
+                        How long the output must be continuously quiet before a
+                        marker-less reply is accepted as complete (the fallback
+                        when the model omits the closing marker). Default with
+                        --extract-structural: min(max(4 x --idle-ms, 30000),
+                        --timeout-ms / 2). A settled screen is accepted on the
+                        last of the --timeout-ms budget regardless, so the grace
+                        never costs a timeout. 0 completes on the first settled
+                        screen (the pre-0.13.0 --extract-structural behavior).
+                        With strict --extract there is no grace unless this flag
+                        sets one.
     --no-jitter         Write each --cmd as a single burst with no per-keystroke
                         human-cadence delay. The default jitter types one char
                         at a time (40-300 ms each), which is minutes for a
@@ -108,6 +121,9 @@ struct Args {
     /// `--extract-structural`: allow the chrome-filtered structural fallback
     /// when the sentinel markers are absent. Off by default (sentinel-strict).
     extract_structural: bool,
+    /// `--extract-grace-ms`: explicit marker-less grace for the IDLE gate.
+    /// `None` = not given (the mode's default applies, see [`idle_gate_for`]).
+    extract_grace: Option<Duration>,
     cwd: Option<String>,
     program: String,
     program_args: Vec<String>,
@@ -163,6 +179,7 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
     let mut prompts: Vec<String> = Vec::new();
     let mut extract = false;
     let mut extract_structural = false;
+    let mut extract_grace: Option<Duration> = None;
     let mut cwd: Option<String> = None;
 
     let mut i = 0;
@@ -229,6 +246,15 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
                 extract_structural = true;
                 config.tui = true;
             }
+            // The marker-less grace: how long the output must be quiet before a
+            // reply without the closing marker is accepted (see `idle_gate_for`).
+            "--extract-grace-ms" => {
+                let v = take_value("--extract-grace-ms")?;
+                let ms: u64 = v
+                    .parse()
+                    .map_err(|_| format!("invalid --extract-grace-ms: {v}"))?;
+                extract_grace = Some(Duration::from_millis(ms));
+            }
             "--no-jitter" => config.burst_input = true,
             "--paste-input" => config.paste_input = true,
             "--wrap-input" => {
@@ -259,42 +285,97 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
         config,
         extract,
         extract_structural,
+        extract_grace,
         cwd,
         program: rest[0].clone(),
         program_args: rest[1..].to_vec(),
     })))
 }
 
-/// Builds a unique per-run ASCII sentinel pair. Plain `[A-Za-z0-9_]` so the
-/// tokens survive shell quoting, typing into the target, and ANSI sanitization.
-fn sentinels() -> (String, String) {
+/// Builds a unique ASCII sentinel pair for command `seq`. Plain `[A-Za-z0-9_]` so
+/// the tokens survive shell quoting, typing into the target, and ANSI sanitization.
+///
+/// The pair is per COMMAND, not per run: the closing marker is what completes the
+/// reply wait, so a pair shared by every `--cmd` would leave the gate open on the
+/// previous command's marker — already in the transcript — before the next reply
+/// exists. `seq` makes the distinction deterministic rather than relying on the
+/// clock advancing between two calls.
+fn sentinels(seq: usize) -> (String, String) {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tok = format!("{:x}{:x}", std::process::id(), nanos);
+    let tok = format!("{:x}{:x}{:x}", std::process::id(), nanos, seq);
     (format!("FCB_{tok}_BEGIN"), format!("FCB_{tok}_END"))
 }
 
-/// The IDLE gate for the orchestrator, given the (optional) sentinel pair and whether
-/// the structural fallback (`--extract-structural`) is enabled.
+/// The IDLE gate for the orchestrator, given the (optional) sentinel pair, whether
+/// the structural fallback (`--extract-structural`) is enabled, and an explicit
+/// `--extract-grace-ms` if the caller passed one.
 ///
-/// - Strict `--extract` (sentinels present, NOT structural) → `Some(end)`: gate IDLE on
-///   the closing marker so a mid-think pause is not mistaken for a finished reply.
-/// - `--extract-structural` → `None`: the model intermittently omits the sentinel (e.g.
-///   claude refusing the wrap protocol). Marker-gating then burns the full `--timeout-ms`
-///   and FAILS even though the structural fallback could recover the reply. With no gate a
-///   SETTLED screen is treated as idle (like `--tui`) and the reply is scraped (marker
-///   first, structural fallback) — fast AND marker-less-tolerant.
+/// - Strict `--extract` (sentinels present, NOT structural) → gate on the closing
+///   marker with NO marker-less grace unless `--extract-grace-ms` sets one: a
+///   mid-think pause must not be mistaken for a finished reply, and with no
+///   structural fallback a marker-less run has no reply to recover anyway.
+/// - `--extract-structural` → the same marker gate, plus a marker-less grace
+///   (explicit, else [`default_markerless_grace`]). The model intermittently omits
+///   the sentinel (e.g. claude refusing the wrap protocol); pure marker-gating then
+///   burns the full `--timeout-ms` and FAILS even though the structural fallback
+///   could recover the reply (#55). But dropping the gate altogether made a SETTLED
+///   screen the only completion signal, so any think-pause longer than `--idle-ms`
+///   ended the reply wait early and the scrape returned chrome instead of the answer
+///   (#68). The grace keeps both properties: marker-first completion, and a bounded
+///   settle-based fallback for a genuinely marker-less reply.
 /// - No `--extract` → `None` (unchanged).
 ///
-/// Pure so it is unit-testable without a PTY. (#55)
-fn idle_gate_for(sentinels: &Option<(String, String)>, extract_structural: bool) -> Option<String> {
-    match sentinels {
-        Some((_, end)) if !extract_structural => Some(end.clone()),
-        _ => None,
-    }
+/// Pure so it is unit-testable without a PTY. (#55, #68)
+fn idle_gate_for(
+    sentinels: &Option<(String, String)>,
+    extract_structural: bool,
+    explicit_grace: Option<Duration>,
+    idle: Duration,
+    exec_timeout: Duration,
+) -> Option<IdleGate> {
+    let (_, end) = sentinels.as_ref()?;
+    let markerless_grace = if extract_structural {
+        Some(explicit_grace.unwrap_or_else(|| default_markerless_grace(idle, exec_timeout)))
+    } else {
+        explicit_grace
+    };
+    Some(IdleGate {
+        needle: end.clone(),
+        markerless_grace,
+    })
+}
+
+/// The default marker-less grace for `--extract-structural`:
+/// `min(max(4 * idle, 30s), exec_timeout / 2)`.
+///
+/// Each term is load-bearing:
+/// - the **30 s floor** is the quiet window a large model actually needs under
+///   concurrent multi-session load — anything shorter is the same guess about
+///   model latency that `--idle-ms` has been ratcheted through (4000 → 8000 →
+///   12000 → 30000) without ever converging;
+/// - the **`4 * idle`** term honours the caller's own latency signal: a driver
+///   that already tells us it expects long silences (`--idle-ms 12000` for an
+///   agentic run) gets a proportionally longer grace (48 s);
+/// - the **`exec_timeout / 2` cap** keeps the grace well inside the watchdog
+///   budget, so a marker-less reply normally completes on quiet rather than on
+///   the deadline. It deliberately wins over the floor for a short
+///   `--timeout-ms`.
+///
+/// The cap alone does NOT bound the wait: the grace is measured from the last
+/// content change, so a reply whose last chunk lands late still needs more than
+/// the remaining budget. What guarantees the fallback never costs a `124` is
+/// [`Wrapper::wait_until_idle`] accepting a settled screen on the last of the
+/// budget, for any grace value — including an explicit `--extract-grace-ms`
+/// larger than the whole timeout.
+///
+/// Pure so it is unit-testable without a PTY.
+fn default_markerless_grace(idle: Duration, exec_timeout: Duration) -> Duration {
+    const FLOOR: Duration = Duration::from_secs(30);
+    (4 * idle).max(FLOOR).min(exec_timeout / 2)
 }
 
 /// Appends the sentinel wrap instruction to a typed command, asking the target
@@ -378,36 +459,66 @@ fn run(args: Args) -> flat_cyborg::Result<ExitCode> {
 fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     let tui = args.config.tui;
     let program = args.program.clone();
-    // With --extract we ALWAYS wrap the prompt with a per-run sentinel pair (for
-    // every target, including known CLIs): the markers are self-validating and
-    // are tried first when extracting. The pair is generated once so the same
-    // markers are used for both wrapping and extraction.
-    let sentinels = args.extract.then(sentinels);
-    let mut config = args.config;
-    // IDLE gating depends on the extract mode (see `idle_gate_for`): strict --extract
-    // marker-gates IDLE (a mid-think pause must not be mistaken for a finished reply);
-    // --extract-structural does NOT, so a marker-less reply (the model intermittently
-    // omits the sentinel) completes on a settled screen and is recovered structurally
-    // instead of burning the full --timeout-ms and failing. (#55)
-    config.idle_gate = idle_gate_for(&sentinels, args.extract_structural);
-    let mut wrapper = Wrapper::with_config(session, config);
+    let idle_silence = args.config.idle_silence;
+    let exec_timeout = args.config.exec_timeout;
+    let mut wrapper = Wrapper::with_config(session, args.config);
     let mut last = Outcome::Completed;
-    for cmd in &args.cmds {
+    // The last command's sentinel pair — what the final capture is extracted
+    // between.
+    let mut sentinels_used: Option<(String, String)> = None;
+    for (seq, cmd) in args.cmds.iter().enumerate() {
+        // With --extract we ALWAYS wrap the prompt with sentinel markers (for
+        // every target, including known CLIs): they are self-validating and are
+        // tried first when extracting. A FRESH pair per command — the closing
+        // marker is the gate's completion signal, so reusing one pair would let
+        // the previous command's marker, still in the transcript, complete this
+        // command's reply wait before the answer exists.
+        let pair = args.extract.then(|| sentinels(seq));
+        // IDLE gating depends on the extract mode (see `idle_gate_for`): both
+        // --extract modes marker-gate IDLE (a mid-think pause must not be mistaken
+        // for a finished reply), and --extract-structural additionally accepts a
+        // settled screen once the marker-less grace has elapsed, so a reply that
+        // omits the sentinel is still recovered structurally instead of burning
+        // the full --timeout-ms. (#55, #68)
+        let gate = idle_gate_for(
+            &pair,
+            args.extract_structural,
+            args.extract_grace,
+            idle_silence,
+            exec_timeout,
+        );
+        wrapper.set_idle_gate(gate);
         // Wrapping (when used) is kept a CLI concern; the wrapper library stays
         // unaware of sentinels.
-        let effective = match &sentinels {
+        let effective = match &pair {
             Some((begin, end)) => wrap_command(cmd, begin, end),
             None => cmd.clone(),
         };
+        sentinels_used = pair;
         last = wrapper.run_command(&effective)?;
         if last == Outcome::TimedOut {
             break;
         }
     }
+    // Tell the operator WHICH completion signal ended the run. Without this, a
+    // reply scraped from a screen that merely went quiet is indistinguishable
+    // from one the model actually finished and fenced — the difference between
+    // "no verdict" and "captured too early". The wrapper reports the marker-less
+    // path only when it actually took it, so a target that exited on its own or
+    // was killed by the watchdog cannot inflate the marker-less rate operators
+    // measure from this line. The number is the OBSERVED quiet window: on the
+    // watchdog-budget bound that is much shorter than the configured grace.
+    if let Some(quiet) = wrapper.markerless_quiet() {
+        eprintln!(
+            "flat-cyborg: --extract: no closing sentinel; completed on the \
+             marker-less grace ({} ms)",
+            quiet.as_millis()
+        );
+    }
     print_capture(
         &wrapper,
         tui,
-        sentinels.as_ref(),
+        sentinels_used.as_ref(),
         &program,
         args.extract_structural,
     );
@@ -427,7 +538,7 @@ fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     print_capture(
         &wrapper,
         tui,
-        args.extract.then(sentinels).as_ref(),
+        args.extract.then(|| sentinels(0)).as_ref(),
         &program,
         args.extract_structural,
     );
@@ -554,7 +665,7 @@ mod tests {
 
     #[test]
     fn sentinels_are_distinct_ascii() {
-        let (b, e) = sentinels();
+        let (b, e) = sentinels(0);
         assert_ne!(b, e);
         assert!(b.ends_with("_BEGIN"));
         assert!(e.ends_with("_END"));
@@ -563,15 +674,134 @@ mod tests {
     }
 
     #[test]
+    fn each_command_gets_its_own_sentinel_pair() {
+        // The closing marker completes the reply wait, so two commands sharing a
+        // pair would let command A's marker — still in the transcript — end
+        // command B's wait before B has answered. The sequence number makes the
+        // pairs differ even if the clock does not advance between the calls.
+        let (b0, e0) = sentinels(0);
+        let (b1, e1) = sentinels(1);
+        assert_ne!(b0, b1, "BEGIN markers must differ per command");
+        assert_ne!(e0, e1, "END markers must differ per command");
+    }
+
+    /// `--idle-ms` / `--timeout-ms` defaults, so the gate tests read as the CLI
+    /// behaves out of the box.
+    const IDLE: Duration = Duration::from_millis(500);
+    const TIMEOUT: Duration = Duration::from_secs(60);
+
+    #[test]
     fn idle_gate_for_modes() {
         let s = Some(("FCB_x_BEGIN".to_string(), "FCB_x_END".to_string()));
-        // strict --extract: gate IDLE on the closing marker.
-        assert_eq!(idle_gate_for(&s, false), Some("FCB_x_END".to_string()));
-        // --extract-structural: NO marker gate (settle-based, marker-less-tolerant).
-        assert_eq!(idle_gate_for(&s, true), None);
+        // strict --extract: gate IDLE on the closing marker, no marker-less grace
+        // (the watchdog is the backstop).
+        let strict = idle_gate_for(&s, false, None, IDLE, TIMEOUT).expect("gate");
+        assert_eq!(strict.needle, "FCB_x_END");
+        assert_eq!(strict.markerless_grace, None);
+        // --extract-structural: same marker gate PLUS a bounded settle fallback.
+        let structural = idle_gate_for(&s, true, None, IDLE, TIMEOUT).expect("gate");
+        assert_eq!(structural.needle, "FCB_x_END");
+        assert_eq!(
+            structural.markerless_grace,
+            Some(default_markerless_grace(IDLE, TIMEOUT)),
+            "--extract-structural must default the grace, not disable the gate"
+        );
         // no --extract: no gate, regardless of the structural flag.
-        assert_eq!(idle_gate_for(&None, false), None);
-        assert_eq!(idle_gate_for(&None, true), None);
+        assert!(idle_gate_for(&None, false, None, IDLE, TIMEOUT).is_none());
+        assert!(idle_gate_for(&None, true, None, IDLE, TIMEOUT).is_none());
+    }
+
+    #[test]
+    fn idle_gate_for_honours_an_explicit_grace() {
+        let s = Some(("FCB_x_BEGIN".to_string(), "FCB_x_END".to_string()));
+        let explicit = Some(Duration::from_millis(7000));
+        // --extract-grace-ms overrides the structural default ...
+        assert_eq!(
+            idle_gate_for(&s, true, explicit, IDLE, TIMEOUT)
+                .expect("gate")
+                .markerless_grace,
+            explicit
+        );
+        // ... and opts strict --extract into a grace it does not have by default.
+        assert_eq!(
+            idle_gate_for(&s, false, explicit, IDLE, TIMEOUT)
+                .expect("gate")
+                .markerless_grace,
+            explicit
+        );
+        // `0` is the escape hatch: a settled screen completes immediately, which
+        // is the pre-0.13.0 --extract-structural behaviour (and the A/B control).
+        assert_eq!(
+            idle_gate_for(&s, true, Some(Duration::ZERO), IDLE, TIMEOUT)
+                .expect("gate")
+                .markerless_grace,
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn default_markerless_grace_floor() {
+        // A small --idle-ms must not shrink the grace below the 30 s floor: the
+        // floor, not the idle window, is the quiet period a large model needs.
+        assert_eq!(
+            default_markerless_grace(Duration::from_millis(500), Duration::from_secs(600)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn default_markerless_grace_scales_with_idle() {
+        // A caller that already signals long silences (--idle-ms 12000 for an
+        // agentic run) gets 4x that, above the floor.
+        assert_eq!(
+            default_markerless_grace(Duration::from_secs(12), Duration::from_secs(600)),
+            Duration::from_secs(48)
+        );
+    }
+
+    #[test]
+    fn default_markerless_grace_is_capped_below_the_watchdog() {
+        // The cap wins over both the 4x term and the floor, so the marker-less
+        // fallback always fires before the watchdog — it can never turn a
+        // completed run into a 124 timeout (#55 must not come back).
+        assert_eq!(
+            default_markerless_grace(Duration::from_secs(12), Duration::from_secs(60)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            default_markerless_grace(Duration::from_millis(500), Duration::from_secs(20)),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn extract_grace_ms_flag_parses() {
+        let m = parse_from(vec![
+            "--extract-structural".into(),
+            "--extract-grace-ms".into(),
+            "0".into(),
+            "--cmd".into(),
+            "hi".into(),
+            "--".into(),
+            "claude".into(),
+        ])
+        .expect("parse");
+        match m {
+            Mode::Run(a) => assert_eq!(a.extract_grace, Some(Duration::ZERO)),
+            _ => panic!("expected Mode::Run"),
+        }
+    }
+
+    #[test]
+    fn extract_grace_ms_rejects_a_non_numeric_value() {
+        let err = parse_from(vec![
+            "--extract-grace-ms".into(),
+            "later".into(),
+            "--".into(),
+            "claude".into(),
+        ])
+        .expect_err("expected a parse error");
+        assert!(err.contains("invalid --extract-grace-ms"), "got: {err}");
     }
 
     #[test]
