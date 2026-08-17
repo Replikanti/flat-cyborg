@@ -208,9 +208,15 @@ stderr:
 flat-cyborg: --extract: no closing sentinel; completed on the marker-less grace (30000 ms)
 ```
 
+The number is how long the output had *actually* been quiet when the reply was
+accepted — normally the grace, but shorter when the run was accepted on the
+watchdog-budget bound described above.
+
 Treat that line as a signal: it separates "the model genuinely had no answer"
 from "we captured the screen too early", and a high rate of it means the target
-CLI is not rendering the marker as its own line.
+CLI is not rendering the marker as its own line. It is printed only when that
+fallback is what completed the run, so a target that exits on its own (or is cut
+short by the watchdog) never appears in the count.
 
 ### Large prompts
 

@@ -464,9 +464,8 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
     let mut wrapper = Wrapper::with_config(session, args.config);
     let mut last = Outcome::Completed;
     // The last command's sentinel pair — what the final capture is extracted
-    // between — and the grace its gate carried, for the diagnostic below.
+    // between.
     let mut sentinels_used: Option<(String, String)> = None;
-    let mut markerless_grace: Option<Duration> = None;
     for (seq, cmd) in args.cmds.iter().enumerate() {
         // With --extract we ALWAYS wrap the prompt with sentinel markers (for
         // every target, including known CLIs): they are self-validating and are
@@ -488,7 +487,6 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
             idle_silence,
             exec_timeout,
         );
-        markerless_grace = gate.as_ref().and_then(|g| g.markerless_grace);
         wrapper.set_idle_gate(gate);
         // Wrapping (when used) is kept a CLI concern; the wrapper library stays
         // unaware of sentinels.
@@ -505,19 +503,17 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
     // Tell the operator WHICH completion signal ended the run. Without this, a
     // reply scraped from a screen that merely went quiet is indistinguishable
     // from one the model actually finished and fenced — the difference between
-    // "no verdict" and "captured too early". Reported ONLY for the completion
-    // path it names: the settle/grace path (`Outcome::Idle` without an open
-    // gate). A target that exited on its own (`Completed`) or was killed by the
-    // watchdog (`TimedOut`) never consumed the grace, and counting those runs
-    // would inflate the marker-less rate operators measure from this line.
-    if let Some(grace) = markerless_grace {
-        if last == Outcome::Idle && !wrapper.idle_gate_open() {
-            eprintln!(
-                "flat-cyborg: --extract: no closing sentinel; completed on the \
-                 marker-less grace ({} ms)",
-                grace.as_millis()
-            );
-        }
+    // "no verdict" and "captured too early". The wrapper reports the marker-less
+    // path only when it actually took it, so a target that exited on its own or
+    // was killed by the watchdog cannot inflate the marker-less rate operators
+    // measure from this line. The number is the OBSERVED quiet window: on the
+    // watchdog-budget bound that is much shorter than the configured grace.
+    if let Some(quiet) = wrapper.markerless_quiet() {
+        eprintln!(
+            "flat-cyborg: --extract: no closing sentinel; completed on the \
+             marker-less grace ({} ms)",
+            quiet.as_millis()
+        );
     }
     print_capture(
         &wrapper,

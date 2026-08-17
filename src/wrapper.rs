@@ -199,6 +199,20 @@ pub struct Wrapper {
     /// for the current command; the gate opens only above this count. See
     /// [`Wrapper::arm_idle_gate`].
     gate_baseline_hits: usize,
+    /// Whether the target has EVER rendered anything, for the whole session.
+    ///
+    /// TUI settle detection must not fire before the target has painted at least
+    /// once (an empty screen is not a settled one). The question is about the
+    /// target, not about one wait: a second [`Wrapper::run_command`] would
+    /// otherwise wait for output the target has no reason to produce — it has
+    /// already answered and is sitting quietly at its prompt — and burn the whole
+    /// `exec_timeout` in the pre-typing readiness wait without ever delivering
+    /// the command.
+    saw_output: bool,
+    /// How long the output had been quiet when the last [`Wrapper::wait_until_idle`]
+    /// accepted a settled screen WITHOUT the closing marker; `None` when that wait
+    /// completed some other way. See [`Wrapper::markerless_quiet`].
+    markerless_quiet: Option<Duration>,
 }
 
 impl Wrapper {
@@ -220,7 +234,22 @@ impl Wrapper {
             config,
             state: State::Running,
             gate_baseline_hits: 0,
+            saw_output: false,
+            markerless_quiet: None,
         }
+    }
+
+    /// How long the output had been quiet when the most recent
+    /// [`Self::wait_until_idle`] accepted a settled screen *without* the closing
+    /// marker — i.e. the run fell back to [`IdleGate::markerless_grace`] (or to
+    /// the watchdog-budget bound). `None` when that wait completed on the marker,
+    /// on the target exiting, or on the watchdog.
+    ///
+    /// This is the honest answer to "did we capture a finished reply or a screen
+    /// that merely went quiet?", and the number is the observed quiet window, not
+    /// the configured grace.
+    pub fn markerless_quiet(&self) -> Option<Duration> {
+        self.markerless_quiet
     }
 
     /// Replaces the input jitter (e.g. with a zero-delay one in tests).
@@ -540,9 +569,9 @@ impl Wrapper {
         // edge latch: confirm once while the menu is on screen, then re-arm only
         // after it has gone (the menu's text is no longer detected).
         let mut approval_answered = false;
-        // TUI settle detection must not fire before the screen has rendered at
-        // least once.
-        let mut saw_output = false;
+        // A new wait has its own completion path; only the marker-less one sets
+        // this (see `markerless_quiet`).
+        self.markerless_quiet = None;
         self.state = State::Running;
 
         loop {
@@ -563,7 +592,7 @@ impl Wrapper {
 
             match self.session.read_output(self.config.poll_interval) {
                 Output::Data(chunk) => {
-                    saw_output = true;
+                    self.saw_output = true;
                     // The line sanitizer is always maintained (so `clean_log`
                     // works); the screen grid only in TUI mode.
                     let sani_changed = self.sanitizer.feed(&chunk);
@@ -653,7 +682,7 @@ impl Wrapper {
                         let idle = if self.config.tui {
                             // A settled screen is IDLE for a full-screen TUI;
                             // there is no line prompt to match.
-                            saw_output
+                            self.saw_output
                         } else {
                             let tokens: Vec<&str> = self
                                 .config
@@ -674,12 +703,19 @@ impl Wrapper {
                         // think-pause no longer ends the reply wait. The fallback
                         // also fires on the last of the watchdog budget, so it
                         // never costs a settled screen a `124`.
-                        if idle
-                            && (self.idle_gate_open()
-                                || self.markerless_settle_allowed(start, last_activity))
-                        {
-                            self.state = State::Idle;
-                            return Ok(Outcome::Idle);
+                        if idle {
+                            let on_marker = self.idle_gate_open();
+                            if on_marker || self.markerless_settle_allowed(start, last_activity) {
+                                if !on_marker {
+                                    // Record how long the screen had ACTUALLY been
+                                    // quiet, which is what the caller reports: on
+                                    // the budget bound that is much less than the
+                                    // configured grace.
+                                    self.markerless_quiet = Some(last_activity.elapsed());
+                                }
+                                self.state = State::Idle;
+                                return Ok(Outcome::Idle);
+                            }
                         }
                     }
                 }
@@ -1047,14 +1083,16 @@ mod tests {
         // behaviour it replaced. Arming the gate must require a NEW marker.
         //
         // The "model" prints its marker straight away (command A), then pauses
-        // and prints an unfenced second answer (command B).
+        // and prints an unfenced second answer (command B), which B's wait must
+        // sit through — it is only accepted once the grace has run from THAT
+        // answer, well past the moment the stale marker would have ended it.
         let mut w = wrapper(
             "sh",
             &[
                 "-c",
-                "printf 'FCB_T_END\\n'; sleep 2; printf 'second answer\\n'; sleep 60",
+                "printf 'FCB_T_END\\n'; sleep 0.5; printf 'second answer\\n'; sleep 60",
             ],
-            gated_config(Some(Duration::from_millis(1500)), Duration::from_secs(20)),
+            gated_config(Some(Duration::from_secs(2)), Duration::from_secs(20)),
         );
 
         // Command A completes on its marker.
@@ -1107,6 +1145,58 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(700) && elapsed < Duration::from_secs(10),
             "must complete on the NEW marker, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn two_commands_complete_against_a_target_silent_between_replies() {
+        // End-to-end multi-command path, through `run_command` (what the CLI
+        // actually calls) rather than `wait_until_idle` directly.
+        //
+        // Command 1 completes the instant its closing marker renders, so the
+        // target is silent when command 2's PRE-TYPING readiness wait starts —
+        // it has already answered and has no reason to speak first. A readiness
+        // check asking "has anything arrived during THIS wait" can then never be
+        // satisfied: the wait burns the whole `exec_timeout`, the command is
+        // never typed, and the run ends TimedOut with nothing captured. The
+        // question the readiness wait must ask is whether the target has EVER
+        // rendered.
+        //
+        // The "model": prints a banner, then answers every prompt with just its
+        // closing marker and nothing else.
+        let mut w = wrapper(
+            "sh",
+            &[
+                "-c",
+                "printf 'banner\\n'; while read l; do printf 'FCB_T_END\\n'; done",
+            ],
+            gated_config(Some(Duration::from_secs(2)), Duration::from_secs(5)),
+        );
+
+        let start = Instant::now();
+        assert_eq!(
+            w.run_command("first").expect("first command"),
+            Outcome::Idle
+        );
+        assert_eq!(
+            w.run_command("second").expect("second command"),
+            Outcome::Idle,
+            "the second command never completed — its readiness wait burned the \
+             watchdog without ever delivering the prompt"
+        );
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            transcript_line_hits(&w.screen_full_text(), "FCB_T_END"),
+            2,
+            "both commands must have been answered; screen: {:?}",
+            w.screen_full_text()
+        );
+        // Each command completes on its marker; neither pays the 2 s grace, let
+        // alone the 5 s watchdog.
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the commands did not complete on their markers, took {elapsed:?}"
         );
     }
 

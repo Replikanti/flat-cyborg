@@ -22,8 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior exactly — the operator escape hatch.
 - A stderr diagnostic when a run completes on that grace instead of on the
   marker: `flat-cyborg: --extract: no closing sentinel; completed on the
-  marker-less grace (<N> ms)`. It separates "the model had no answer" from "we
-  captured the screen too early", which was previously indistinguishable.
+  marker-less grace (<N> ms)`, where `<N>` is how long the output had actually
+  been quiet. It separates "the model had no answer" from "we captured the
+  screen too early", which was previously indistinguishable, and is emitted only
+  when that fallback is what completed the run.
 
 ### Changed
 
@@ -48,6 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the printed reply is the last command's), with a per-command gate arming in
   the wrapper as a backstop for library callers that reuse a needle.
   Single-`--cmd` runs — every current caller — are unaffected.
+- A second and further `--cmd` is no longer stranded in its pre-typing readiness
+  wait when the target is silent between replies. The readiness check asked
+  whether anything had arrived during *that* wait; a target that has just
+  answered and is sitting at its prompt has no reason to speak first, so the
+  wait burned the whole `--timeout-ms` without ever delivering the prompt and
+  the run ended `124` with an empty capture. It now asks whether the target has
+  ever rendered, which is the question it was always meant to ask.
 
 ## [0.12.1] — 2026-07-15
 
