@@ -310,19 +310,27 @@ fn extract_grace_ms_zero_completes_on_a_settled_screen() {
 
 #[test]
 fn two_commands_are_both_delivered_and_the_last_reply_is_printed() {
-    // End-to-end multi-`--cmd` run. The "model" prints a banner, then answers
-    // each prompt by fencing ANSWER between that prompt's own markers (picked
-    // out of the wrap instruction) and NOTHING after the closing one — so each
-    // command completes on its own sentinel and the target is then completely
-    // silent. That silence used to strand the next command's pre-typing
-    // readiness wait: the run ended `124` with an empty capture because the
-    // second prompt was never typed.
+    // End-to-end multi-`--cmd` run, with the two completion paths in one run:
+    // the "model" prints a banner, answers the FIRST prompt without any markers
+    // (so that command completes on the marker-less grace), and answers the
+    // SECOND by fencing ANSWER between that prompt's own markers (picked out of
+    // the wrap instruction) with NOTHING after the closing one — so it completes
+    // on its sentinel and the target then goes completely silent.
+    //
+    // Two regressions meet here. That silence used to strand the next command's
+    // pre-typing readiness wait: the run ended `124` with an empty capture
+    // because the second prompt was never typed. And the marker-less report is
+    // per-wait state, so a stale one from command 1 must not be attributed to
+    // command 2 — a fenced reply reported as marker-less is a false entry in the
+    // rate operators measure from that line.
     let out = Command::new(bin())
         .args([
             "--extract-structural",
             "--no-jitter",
             "--idle-ms",
             "300",
+            "--extract-grace-ms",
+            "700",
             "--timeout-ms",
             "10000",
             "--cmd",
@@ -332,9 +340,11 @@ fn two_commands_are_both_delivered_and_the_last_reply_is_printed() {
             "--",
             "sh",
             "-c",
-            "printf 'banner\\n'; while read l; do b=; e=; for w in $l; do \
+            "n=1; printf 'banner\\n'; while read l; do \
+             if [ \"$n\" = 1 ]; then printf 'UNFENCED\\n'; else \
+             b=; e=; for w in $l; do \
              case $w in FCB_*_BEGIN) b=$w ;; FCB_*_END) e=$w ;; esac; done; \
-             printf '%s\\nANSWER\\n%s\\n' \"$b\" \"$e\"; done",
+             printf '%s\\nANSWER\\n%s\\n' \"$b\" \"$e\"; fi; n=$((n+1)); done",
         ])
         .stdin(Stdio::null())
         .output()
@@ -349,8 +359,15 @@ fn two_commands_are_both_delivered_and_the_last_reply_is_printed() {
         !stderr.contains("no fenced reply"),
         "the last command's fence was not found, so it was never delivered: {stderr:?}"
     );
+    // The run ENDED on command 2's sentinel, so it must not be reported as
+    // marker-less on account of command 1 having been.
+    assert!(
+        !stderr.contains("marker-less grace"),
+        "a fenced final reply was reported as marker-less (stale state from the \
+         earlier command): {stderr:?}"
+    );
     // Only the LAST command's fenced reply is printed, and it is the reply
-    // itself — not chrome, not the echoed instruction.
+    // itself — not chrome, not the echoed instruction, not command 1's UNFENCED.
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ANSWER");
 }
 
