@@ -579,11 +579,21 @@ impl Wrapper {
             match interrupted_at {
                 Some(t) if t.elapsed() >= self.config.interrupt_grace => {
                     // Graceful Ctrl+C did not work in time: SIGKILL the group.
+                    crate::diag!(
+                        "wrapper.watchdog-sigkill",
+                        "elapsed_ms={}",
+                        start.elapsed().as_millis()
+                    );
                     self.session.terminate();
                     return Ok(Outcome::TimedOut);
                 }
                 None if start.elapsed() >= self.config.exec_timeout => {
                     // First escalation: send Ctrl+C and start the grace timer.
+                    crate::diag!(
+                        "wrapper.watchdog-interrupt",
+                        "elapsed_ms={}",
+                        start.elapsed().as_millis()
+                    );
                     let _ = self.session.write_input(&[0x03]);
                     interrupted_at = Some(Instant::now());
                 }
@@ -670,6 +680,12 @@ impl Wrapper {
                     // the marker never appears. (`idle_gate_open()` reads the
                     // just-fed screen grid in TUI mode.)
                     if self.config.idle_gate.is_some() && self.idle_gate_open() {
+                        // Completed on the closing sentinel — the clean path.
+                        crate::diag!(
+                            "wrapper.gate-open",
+                            "elapsed_ms={}",
+                            start.elapsed().as_millis()
+                        );
                         self.state = State::Idle;
                         return Ok(Outcome::Idle);
                     }
@@ -713,6 +729,12 @@ impl Wrapper {
                                     // configured grace.
                                     self.markerless_quiet = Some(last_activity.elapsed());
                                 }
+                                crate::diag!(
+                                    "wrapper.idle-settle",
+                                    "on_marker={on_marker} elapsed_ms={} quiet_ms={}",
+                                    start.elapsed().as_millis(),
+                                    last_activity.elapsed().as_millis()
+                                );
                                 self.state = State::Idle;
                                 return Ok(Outcome::Idle);
                             }
@@ -720,11 +742,24 @@ impl Wrapper {
                     }
                 }
                 Output::Eof => {
-                    return Ok(if interrupted_at.is_some() {
+                    let outcome = if interrupted_at.is_some() {
                         Outcome::TimedOut
                     } else {
                         Outcome::Completed
-                    });
+                    };
+                    // The prime #71 suspect: the target's slave closed (it
+                    // exited) mid-wait. `interrupted=false` means flat-cyborg did
+                    // NOT abort it — the target vanished on its own and we are
+                    // completing via EOF, not self-faulting. `gate_open` shows
+                    // whether the reply had already been fenced when it died.
+                    crate::diag!(
+                        "wrapper.eof",
+                        "outcome={outcome:?} interrupted={} gate_open={} elapsed_ms={}",
+                        interrupted_at.is_some(),
+                        self.idle_gate_open(),
+                        start.elapsed().as_millis()
+                    );
+                    return Ok(outcome);
                 }
             }
         }

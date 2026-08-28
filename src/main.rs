@@ -603,10 +603,19 @@ fn exit_code_for(wrapper: &mut Wrapper, outcome: Outcome) -> ExitCode {
         Outcome::TimedOut => ExitCode::from(124),
         Outcome::Idle => ExitCode::SUCCESS,
         Outcome::Completed => {
-            let code = wrapper
-                .session()
-                .wait_with_timeout(Duration::from_secs(2))
-                .and_then(|status| status.code());
+            let status = wrapper.session().wait_with_timeout(Duration::from_secs(2));
+            let code = status.and_then(|s| s.code());
+            // Diagnostic tap (off unless FLAT_CYBORG_DIAG is set): the final
+            // per-run classification the #71 harness buckets on. A `Completed`
+            // outcome means the target's PTY closed while un-interrupted; the
+            // resolved code separates a clean target exit from one killed by a
+            // signal (`code=none` -> exit 1 here, NOT flat-cyborg self-faulting).
+            flat_cyborg::diag!(
+                "exit.classify",
+                "outcome=Completed reaped={} code={}",
+                status.is_some(),
+                code.map_or_else(|| "none".to_string(), |c| c.to_string())
+            );
             match code {
                 Some(c) => ExitCode::from(c.clamp(0, 255) as u8),
                 None => ExitCode::FAILURE, // killed by signal / unknown
