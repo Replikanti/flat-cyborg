@@ -154,6 +154,15 @@ impl PtySession {
             command = command.current_dir(dir);
         }
         let child = command.spawn(pts)?;
+        // Diagnostic tap (off unless FLAT_CYBORG_DIAG is set): record the spawn
+        // with the child pid and current fd count, so a harness can see fd
+        // pressure build across concurrent sessions. Observation only.
+        crate::diag!(
+            "pty.spawn",
+            "child_pid={} fds={}",
+            child.id(),
+            crate::diag::open_fd_count()
+        );
 
         // `Read`/`Write` are implemented for `&Pty`, so the two threads can
         // share the master via `Arc` without any interior mutability. The PTY
@@ -165,12 +174,19 @@ impl PtySession {
         let reader = thread::spawn(move || {
             let mut handle: &Pty = &reader_pty;
             let mut buf = [0u8; READ_CHUNK];
-            loop {
+            // Counters exposed on exit so a harness can see backpressure (many
+            // chunks buffered before the receiver drained them) vs. a stream
+            // that produced almost nothing before ending. Observation only.
+            let mut chunks: u64 = 0;
+            let mut total: u64 = 0;
+            let reason: &str = loop {
                 match handle.read(&mut buf) {
-                    Ok(0) => break, // clean EOF
+                    Ok(0) => break "clean-eof",
                     Ok(n) => {
+                        chunks += 1;
+                        total += n as u64;
                         if out_tx.send(buf[..n].to_vec()).is_err() {
-                            break; // receiver dropped
+                            break "receiver-dropped";
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -178,9 +194,13 @@ impl PtySession {
                     // surfaces as EIO, which is the expected end-of-stream
                     // signal here. Any other error is also terminal for the
                     // stream, so we stop reading in every error case.
-                    Err(_) => break,
+                    Err(_) => break "read-error",
                 }
-            }
+            };
+            crate::diag!(
+                "pty.reader-exit",
+                "reason={reason} chunks={chunks} bytes={total}"
+            );
         });
 
         let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>();
@@ -189,12 +209,18 @@ impl PtySession {
             let mut handle: &Pty = &writer_pty;
             // Exits when the input channel is dropped (Disconnected) or a write
             // fails (the child closed the slave).
-            while let Ok(bytes) = in_rx.recv() {
-                if handle.write_all(&bytes).is_err() {
-                    break;
+            let reason: &str = loop {
+                match in_rx.recv() {
+                    Ok(bytes) => {
+                        if handle.write_all(&bytes).is_err() {
+                            break "write-failed";
+                        }
+                        let _ = handle.flush();
+                    }
+                    Err(_) => break "input-dropped",
                 }
-                let _ = handle.flush();
-            }
+            };
+            crate::diag!("pty.writer-exit", "reason={reason}");
         });
 
         Ok(Self {
@@ -300,6 +326,15 @@ impl PtySession {
             return;
         }
         self.terminated = true;
+        // Diagnostic tap (off unless FLAT_CYBORG_DIAG is set): the watchdog's
+        // last-resort SIGKILL path. Distinguishes "flat-cyborg killed the
+        // target" from the target exiting on its own. Observation only.
+        crate::diag!(
+            "pty.terminate",
+            "child_pid={} fds={}",
+            self.child.id(),
+            crate::diag::open_fd_count()
+        );
         // Kill the whole group *before* reaping, so any grandchild holding the
         // slave fd dies and the reader's blocking read unblocks with EOF/EIO.
         // (`child.id()` is only valid before `wait`.)

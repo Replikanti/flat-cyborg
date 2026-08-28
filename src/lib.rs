@@ -20,6 +20,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod ansi;
+pub mod diag;
 pub mod error;
 pub mod jitter;
 pub mod pty;
