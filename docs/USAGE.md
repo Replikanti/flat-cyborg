@@ -218,6 +218,26 @@ CLI is not rendering the marker as its own line. It is printed only when that
 fallback is what completed the run, so a target that exits on its own (or is cut
 short by the watchdog) never appears in the count.
 
+#### When the target closes the PTY (EOF)
+
+Under `--extract` there are three ways a run can end when the target's PTY
+closes, and flat-cyborg distinguishes them by exit code:
+
+- **Clean exit after a fenced reply → exit `0`.** The closing marker completes
+  the wait *before* EOF is read (the reply is captured on the marker), so a
+  target that then quits is a normal success.
+- **Mid-reply death with the reply LOST → exit `75`.** The target closed the PTY
+  un-interrupted with the completion gate never opened (e.g. it crashed, or was
+  OOM-killed under load) **and** no reply could be recovered — so the answer the
+  caller asked for never arrived. This is a transient the caller may retry
+  (`EX_TEMPFAIL`); see the Exit codes table. **But a missing closing marker is not
+  a lost reply:** under `--extract-structural`, if the chrome-free structural
+  fallback still recovers the reply from the settled screen, the answer reached
+  stdout and the run exits `0`, not `75`. Without `--extract` there is no gate, so
+  a plain-capture exit stays a `Completed` passthrough of the target's own code.
+- **Watchdog abort → exit `124`.** flat-cyborg itself interrupted the target
+  after `--timeout-ms` (the marker never appeared and the screen never settled).
+
 ### Large prompts
 
 Three limits bite when the prompt gets big, each with its own flag:
@@ -288,6 +308,7 @@ does not, or when you specifically need the interactive path.
 | target's code | In capture/orchestrator mode, the target's own exit status is propagated. |
 | `1` | Generic failure — flat-cyborg itself failed (e.g. the target could not be spawned), or the target was killed by a signal. |
 | `2` | Usage error (bad arguments). |
+| `75` | The target exited **mid-reply** and the reply was **lost** — it closed the PTY, un-interrupted, under `--extract` with the gate never opened, and no reply could be recovered (not even by the `--extract-structural` fallback). `75` is `EX_TEMPFAIL` ("temporary failure; retry"): a **transient** the caller may re-run. It overrides the target's own passthrough status on this arm only. A missing closing marker alone is **not** a lost reply: if `--extract-structural` still recovers the answer from the settled screen it returns `0`; a clean reply-then-exit returns `0`; and plain capture (no `--extract`) keeps propagating the target's own code. |
 | `124` | The watchdog timed out and aborted the operation. |
 
 ## Self-update
@@ -334,6 +355,7 @@ back to `sudo` if the install directory is not writable).
 | Symptom | Likely cause / fix |
 |---------|--------------------|
 | Exit `124`, no output | The target never reached idle. Raise `--idle-ms` and/or `--timeout-ms`; for a full-screen TUI add `--tui`. |
+| Exit `75` under `--extract` | The target vanished mid-reply (it closed the PTY before fencing its answer — e.g. it crashed or was killed under load). This is a **transient**, not a flat-cyborg fault or a usage error: re-run the command. If it recurs, reduce concurrent sessions or check the target CLI's own logs. |
 | `--tui` capture is full of UI chrome | Add `--extract` (with `--cmd`) to print only the model's fenced reply. |
 | `--extract` output is empty or looks like chrome on a slow model | The reply was captured before the model finished. Do **not** raise `--idle-ms`: completion is gated on the closing marker, so check stderr for `completed on the marker-less grace` — if it is there, the target never rendered the marker on its own line. A `124` here means the screen never settled at all (a continuously animated UI), not that the grace was too long: raise `--timeout-ms`. |
 | LLM CLI stuck on a "trust this folder" screen | The menu is arrow-key driven, so the `[y/n]` auto-confirm cannot answer it. Run the CLI in a directory it already trusts, or pass `--auto-approve` to confirm the trust menu (it bypasses the agent's safety gate, so use deliberately). |

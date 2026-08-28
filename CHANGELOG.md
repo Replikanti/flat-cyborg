@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Reserved exit code **`75`** (`EX_TEMPFAIL`, "temporary failure; retry") and a
+  new `Outcome::TargetExitedEarly` for the case a target closes the PTY
+  *mid-reply* under `--extract` — un-interrupted, with the completion gate never
+  opened — **and the reply is lost** (not recoverable even by the
+  `--extract-structural` fallback). This is a transient a caller (or a resilience
+  layer) can retry by contract instead of scraping stderr; it overrides the
+  target's ambiguous passthrough status on this one arm only. A missing closing
+  marker is **not** a lost reply: when `--extract-structural` still recovers the
+  answer from the settled screen it reaches stdout and the run exits `0`, so a
+  recovered reply is never discarded as a false transient. Every other exit code
+  (`0`/`1`/`2`/`124`) and plain-capture semantics (no gate → the exit stays a
+  `Completed` passthrough) are unchanged, so this is additive; a MINOR version
+  bump (0.13.0 → 0.14.0) follows in a separate release PR. A human-readable
+  (non-contract) stderr line is also emitted on the lost-reply arm. (#71)
+
 ## [0.13.0] — 2026-08-17
 
 ### Added
