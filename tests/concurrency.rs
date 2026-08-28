@@ -30,12 +30,44 @@ fn fixture() -> String {
     .to_string()
 }
 
-/// Runs one `flat-cyborg --extract-structural` session against the fixture with
-/// a slow reply. `env` are extra child env knobs (fixture behaviour + diag).
-fn run_session(reply_delay_ms: u32, env: &[(&str, &str)]) -> Output {
+/// Runs one gated `flat-cyborg` session against the fixture with a slow reply.
+/// `extract_flag` selects the completion-gate flavour (`--extract` strict or
+/// `--extract-structural`); `env` are extra child env knobs (fixture behaviour
+/// + diag).
+fn run_session_extract(reply_delay_ms: u32, extract_flag: &str, env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(bin());
     cmd.args([
-        "--extract-structural",
+        extract_flag,
+        "--no-jitter",
+        "--idle-ms",
+        "300",
+        "--timeout-ms",
+        "15000",
+        "--cmd",
+        "ping",
+        "--",
+        "sh",
+        &fixture(),
+    ])
+    .env("REPLY_DELAY_MS", reply_delay_ms.to_string())
+    .stdin(Stdio::null());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn flat-cyborg session")
+}
+
+/// Runs one `flat-cyborg --extract-structural` session (the default gate shape).
+fn run_session(reply_delay_ms: u32, env: &[(&str, &str)]) -> Output {
+    run_session_extract(reply_delay_ms, "--extract-structural", env)
+}
+
+/// Runs one plain-capture `flat-cyborg` session — NO `--extract`, so no
+/// completion gate: an exit is the completion signal and the outcome must stay
+/// `Completed` (the target's own exit code), never reclassified to 75.
+fn run_session_no_gate(reply_delay_ms: u32, env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(bin());
+    cmd.args([
         "--no-jitter",
         "--idle-ms",
         "300",
@@ -126,21 +158,23 @@ fn diagnostics_are_off_by_default() {
     );
 }
 
-/// A target that dies mid-reply (before the closing sentinel) is CLASSIFIED,
-/// not mistaken for a flat-cyborg fault: the diagnostics show it completed via
-/// EOF while un-interrupted, and flat-cyborg faithfully propagates the target's
-/// non-zero exit (it did not self-abort). This is the prime #71 suspect arm,
-/// reproduced deterministically without needing high concurrency.
+/// A target that dies mid-reply (before the closing sentinel) under a configured
+/// `--extract` gate is CLASSIFIED as a distinct, retry-able transient: the M2
+/// fix maps it to the reserved exit code 75 (`EX_TEMPFAIL`) instead of the
+/// target's ambiguous passthrough status. The diagnostics show it completed via
+/// EOF while un-interrupted, with the gate never opened — this is the prime #71
+/// suspect arm, reproduced deterministically without needing high concurrency.
 #[test]
 fn target_death_midway_is_classified_via_eof() {
     let out = run_session(200, &[("DIE_MIDWAY", "1"), ("FLAT_CYBORG_DIAG", "1")]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // flat-cyborg propagated the target's exit(1); it did not crash/abort.
+    // The contract: exit 75 = target vanished mid-reply (retry-able transient),
+    // NOT the target's own exit(1) passthrough.
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "expected propagated target exit 1: status={:?} stderr={stderr:?}",
+        Some(75),
+        "expected reserved exit 75 (target exited mid-reply): status={:?} stderr={stderr:?}",
         out.status
     );
     assert!(
@@ -148,13 +182,80 @@ fn target_death_midway_is_classified_via_eof() {
         "expected the un-interrupted EOF classification: {stderr:?}"
     );
     assert!(
-        stderr.contains("outcome=Completed"),
-        "expected the target-vanished completion classification: {stderr:?}"
+        stderr.contains("outcome=TargetExitedEarly"),
+        "expected the target-vanished classification: {stderr:?}"
+    );
+    // The human-readable (non-contract) observability line is emitted too.
+    assert!(
+        stderr.contains("the target exited before completing its reply"),
+        "expected the observability stderr line: {stderr:?}"
     );
     // No fenced reply arrived, so nothing chrome-like is printed to stdout.
     assert!(
         !stdout.contains('█') && !stdout.contains("FCB_"),
         "capture leaked chrome/sentinel on target death: {stdout:?}"
+    );
+}
+
+/// The crux guard: a target that emits a CLEAN fenced reply and THEN exits is
+/// NOT reclassified as a mid-reply death. The reply completed on the marker
+/// (Idle, exit 0) before EOF was ever read, so exit 75 must not fire.
+#[test]
+fn clean_reply_then_exit_is_not_flagged_as_target_death() {
+    let out = run_session(200, &[("EXIT_AFTER_REPLY", "1")]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean reply-then-exit must succeed, not report the transient: \
+         status={:?} stderr={stderr:?}",
+        out.status
+    );
+    assert_eq!(
+        stdout.trim(),
+        "PONG",
+        "the fenced reply must still be captured: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        !stderr.contains("exited before completing its reply"),
+        "a clean reply must not emit the mid-reply-death line: {stderr:?}"
+    );
+}
+
+/// Strict `--extract` (no structural fallback) still configures the completion
+/// gate, so a mid-reply death is classified as the transient there too: the
+/// exit-75 contract does not depend on `--extract-structural`.
+#[test]
+fn target_death_midway_under_strict_extract_is_also_exit_75() {
+    let out = run_session_extract(200, "--extract", &[("DIE_MIDWAY", "1")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(75),
+        "strict --extract must also report the mid-reply transient: \
+         status={:?} stderr={stderr:?}",
+        out.status
+    );
+}
+
+/// The no-gate path must NOT regress: plain capture (no `--extract`) has no
+/// completion gate, so a target that exits — even the DIE_MIDWAY shape — stays
+/// `Completed` and propagates its own exit code (1 here), never 75.
+#[test]
+fn plain_capture_no_gate_keeps_target_exit_code() {
+    let out = run_session_no_gate(200, &[("DIE_MIDWAY", "1")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "no-gate capture must propagate the target's own exit, not 75: \
+         status={:?} stderr={stderr:?}",
+        out.status
+    );
+    assert!(
+        !stderr.contains("exited before completing its reply"),
+        "the no-gate path must not emit the mid-reply-death line: {stderr:?}"
     );
 }
 

@@ -496,7 +496,9 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
         };
         sentinels_used = pair;
         last = wrapper.run_command(&effective)?;
-        if last == Outcome::TimedOut {
+        // A watchdog timeout or a mid-reply target death ends the session: the
+        // target is gone (or unresponsive), so later `--cmd` commands cannot run.
+        if matches!(last, Outcome::TimedOut | Outcome::TargetExitedEarly) {
             break;
         }
     }
@@ -513,6 +515,15 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
             "flat-cyborg: --extract: no closing sentinel; completed on the \
              marker-less grace ({} ms)",
             quiet.as_millis()
+        );
+    }
+    // Observability only (NOT the machine contract — that is exit 75): tell the
+    // operator the target vanished mid-reply so a bare non-zero exit is not read
+    // as a real fault. The retry-able signal is the exit code, not this string.
+    if last == Outcome::TargetExitedEarly {
+        eprintln!(
+            "flat-cyborg: the target exited before completing its reply \
+             (mid-reply exit; treated as transient, exit {EX_TEMPFAIL})"
         );
     }
     print_capture(
@@ -595,12 +606,23 @@ fn print_capture(
     io::stdout().flush().ok();
 }
 
+/// Reserved exit code for [`Outcome::TargetExitedEarly`]: the target closed the
+/// PTY mid-reply (un-interrupted, under an `--extract` gate that never opened).
+/// `75` is `EX_TEMPFAIL` from `sysexits.h` — "temporary failure; retry" — chosen
+/// so a resilience layer can key on a transient by contract instead of scraping
+/// stderr. It overrides the target's own passthrough status on this one arm
+/// only; every other exit code (0 / 1 / 2 / 124) keeps its existing meaning. See
+/// issue #71.
+const EX_TEMPFAIL: u8 = 75;
+
 /// Maps a terminal [`Outcome`] to a process exit code: the target's own exit
-/// status when it completed, `124` on watchdog timeout, `0` when it merely
+/// status when it completed, `124` on watchdog timeout, `75` when the target
+/// vanished mid-reply (transient; see [`EX_TEMPFAIL`]), `0` when it merely
 /// returned to an idle prompt (our commands ran; the target is still alive).
 fn exit_code_for(wrapper: &mut Wrapper, outcome: Outcome) -> ExitCode {
     match outcome {
         Outcome::TimedOut => ExitCode::from(124),
+        Outcome::TargetExitedEarly => ExitCode::from(EX_TEMPFAIL),
         Outcome::Idle => ExitCode::SUCCESS,
         Outcome::Completed => {
             let status = wrapper.session().wait_with_timeout(Duration::from_secs(2));

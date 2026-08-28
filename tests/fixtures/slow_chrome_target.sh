@@ -15,6 +15,10 @@
 #   OMIT_MARKER     if "1", never print the closing END marker (marker-less)
 #   DIE_MIDWAY      if "1", exit non-zero mid-reply BEFORE the closing marker
 #                   (models the target vanishing mid-call)
+#   EXIT_AFTER_REPLY if "1", exit 0 immediately AFTER the fenced reply + closing
+#                   marker instead of lingering at the idle prompt (models a
+#                   target that answers cleanly then quits — must NOT be flagged
+#                   as a mid-reply death)
 #
 # Dash-safe (CI shell is dash, see CLAUDE.md): multibyte glyphs are written
 # LITERALLY, never as \xHH byte escapes; no bashisms.
@@ -83,6 +87,13 @@ fi
 printf 'PONG\n'
 if [ "$OMIT_MARKER" != 1 ] && [ -n "$e" ]; then
 	printf '%s\n' "$e"
+fi
+
+if [ "$EXIT_AFTER_REPLY" = 1 ]; then
+	# Clean answer, then quit: the reply was already fenced (the gate opened on
+	# the closing marker before EOF), so flat-cyborg must complete on the marker
+	# (Idle/exit 0) and NOT reclassify this as a mid-reply death (exit 75).
+	exit 0
 fi
 
 if [ -n "$b" ]; then

@@ -165,6 +165,16 @@ pub enum Outcome {
     Idle,
     /// The child closed the PTY (it exited).
     Completed,
+    /// The target closed the PTY *mid-reply*, un-interrupted, while an
+    /// `--extract` completion gate was configured but never opened — i.e. it
+    /// vanished before it could fence (or settle) its answer. This is distinct
+    /// from [`Outcome::Completed`]: there the target exited on its own terms
+    /// (a plain capture, or a reply that already completed and returned
+    /// [`Outcome::Idle`] before EOF was ever read); here the reply the caller
+    /// asked for never arrived. It is a *transient* — re-running the command
+    /// may well succeed — so the caller maps it to a dedicated retry-able exit
+    /// code rather than the target's ambiguous passthrough status. See #71.
+    TargetExitedEarly,
     /// The watchdog aborted the operation after `exec_timeout`.
     TimedOut,
 }
@@ -742,16 +752,29 @@ impl Wrapper {
                     }
                 }
                 Output::Eof => {
-                    let outcome = if interrupted_at.is_some() {
-                        Outcome::TimedOut
-                    } else {
-                        Outcome::Completed
-                    };
                     // The prime #71 suspect: the target's slave closed (it
                     // exited) mid-wait. `interrupted=false` means flat-cyborg did
                     // NOT abort it — the target vanished on its own and we are
                     // completing via EOF, not self-faulting. `gate_open` shows
                     // whether the reply had already been fenced when it died.
+                    //
+                    // Classification: an interrupted EOF is a watchdog timeout.
+                    // Otherwise, if an `--extract` gate was configured but never
+                    // opened, the target died BEFORE fencing (or settling) its
+                    // reply — a transient the caller can retry, distinct from a
+                    // clean exit. A clean fenced reply never reaches here: it
+                    // returns `Idle` via the gate-open fast path above, before
+                    // EOF is read (the mpsc drains every buffered chunk ahead of
+                    // Disconnected→Eof). A plain capture with no gate keeps
+                    // `Completed`: with no sentinel contract, the exit IS the
+                    // completion signal.
+                    let outcome = if interrupted_at.is_some() {
+                        Outcome::TimedOut
+                    } else if self.config.idle_gate.is_some() && !self.idle_gate_open() {
+                        Outcome::TargetExitedEarly
+                    } else {
+                        Outcome::Completed
+                    };
                     crate::diag!(
                         "wrapper.eof",
                         "outcome={outcome:?} interrupted={} gate_open={} elapsed_ms={}",
@@ -1040,6 +1063,70 @@ mod tests {
             "the grace did not fire well before the watchdog: {elapsed:?}"
         );
         assert!(!w.idle_gate_open(), "the gate must NOT report a marker");
+    }
+
+    #[test]
+    fn target_dying_before_the_marker_under_a_gate_is_target_exited_early() {
+        // #71: a target that exits mid-reply, un-interrupted, with an `--extract`
+        // gate configured but never opened must be classified as TargetExitedEarly
+        // (a retry-able transient), not as a plain Completed exit. Here the fake
+        // target writes a partial line and exits 1 before ever emitting FCB_T_END.
+        let mut w = wrapper(
+            "sh",
+            &["-c", "printf 'partial'; exit 1"],
+            gated_config(Some(Duration::from_secs(8)), Duration::from_secs(20)),
+        );
+        let outcome = w.wait_until_idle().expect("wait");
+        assert_eq!(
+            outcome,
+            Outcome::TargetExitedEarly,
+            "an un-interrupted mid-reply exit under a gate must be TargetExitedEarly"
+        );
+        assert!(
+            !w.idle_gate_open(),
+            "the gate must not have opened (no closing marker was emitted)"
+        );
+    }
+
+    #[test]
+    fn clean_fenced_reply_returns_idle_before_eof_not_target_exited_early() {
+        // The crux: a clean fenced reply completes as Idle via the gate-open fast
+        // path BEFORE EOF is read (the mpsc drains the marker-bearing chunk ahead
+        // of Disconnected→Eof), even though the target then exits 0. It must NOT
+        // be reclassified as TargetExitedEarly.
+        let mut w = wrapper(
+            "sh",
+            &["-c", "printf 'FCB_T_END\\n'; exit 0"],
+            gated_config(Some(Duration::from_secs(8)), Duration::from_secs(20)),
+        );
+        let outcome = w.wait_until_idle().expect("wait");
+        assert_eq!(
+            outcome,
+            Outcome::Idle,
+            "a fenced reply must complete on the marker (Idle), not via EOF"
+        );
+        assert!(
+            w.idle_gate_open(),
+            "the closing marker must have opened the gate"
+        );
+    }
+
+    #[test]
+    fn plain_capture_exit_with_no_gate_stays_completed() {
+        // The no-gate path must not regress: without an `--extract` completion
+        // gate an exit IS the completion signal, so a target that exits on its own
+        // still returns Completed (never TargetExitedEarly).
+        let mut w = wrapper(
+            "sh",
+            &["-c", "printf 'plain output\\n'; exit 0"],
+            WrapperConfig::default(),
+        );
+        let outcome = w.wait_until_idle().expect("wait");
+        assert_eq!(
+            outcome,
+            Outcome::Completed,
+            "a no-gate exit must stay Completed (exit-code passthrough unchanged)"
+        );
     }
 
     #[test]
