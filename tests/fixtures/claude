@@ -1,0 +1,39 @@
+#!/bin/sh
+# Fake `claude`-basename fixture for the #71 M2 review regression test.
+#
+# Its FILENAME is `claude` on purpose: flat-cyborg dispatches structural
+# extraction on the target program's basename (extract.rs::extract_for_target),
+# so only a `claude`/`codex` basename exercises the marker-less structural
+# fallback. This models the reviewer's scenario: the target renders a complete,
+# chrome-free claude reply bullet WITHOUT the FCB closing sentinel, then the
+# process exits (dies) before the gate could open on a marker. Under
+# --extract-structural the reply is still recoverable from the settled screen,
+# so flat-cyborg must print it and exit 0 — NOT report a lost reply (exit 75).
+#
+# NO live model, NO network: deterministic. Dash-safe (CI shell is dash):
+# multibyte glyphs are written LITERALLY, never as \xHH byte escapes.
+
+# Enter the alternate screen, like a real claude TUI.
+printf '\033[?1049h'
+# Banner chrome above the reply (is_claude_banner matches the ▐/▛ glyphs).
+printf ' ▐▛███▜▌   Claude Code v1.0\n'
+printf '❯ \n'
+
+# Read the wrapped prompt (contains the FCB_*_BEGIN/END markers in the wrap
+# instruction). We deliberately do NOT echo or emit the closing marker, so the
+# completion gate never opens.
+IFS= read -r _cmd || _cmd=
+
+sleep 0.2
+
+# A real claude answer bullet, marker-less. extract_claude anchors on the `●`
+# line and strips the bullet, so the recovered reply is the clean text (which
+# then passes looks_clean — the raw `●` would be rejected as chrome).
+printf '● PONG_STRUCTURAL_REPLY\n'
+printf '\n'
+printf '❯ \n'
+
+# Vanish mid-call: exit non-zero BEFORE any closing marker. flat-cyborg reaches
+# the EOF/Completed-un-interrupted arm with the gate never opened, but the reply
+# is on the settled screen and must be recovered (exit 0), not lost (exit 75).
+exit 1

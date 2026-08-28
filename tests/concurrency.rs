@@ -87,6 +87,37 @@ fn run_session_no_gate(reply_delay_ms: u32, env: &[(&str, &str)]) -> Output {
     cmd.output().expect("spawn flat-cyborg session")
 }
 
+/// Absolute path to the `claude`-BASENAME fixture. Its filename drives the
+/// structural-extraction dispatch (`extract_for_target` keys on the basename),
+/// so it is invoked DIRECTLY (not via `sh`) to exercise the marker-less
+/// structural fallback — see the file header.
+fn claude_fixture() -> String {
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude").to_string()
+}
+
+/// Runs one gated `flat-cyborg` session against the `claude`-basename fixture,
+/// which renders a complete but MARKER-LESS reply and then dies. `extract_flag`
+/// selects strict `--extract` (no structural fallback) vs `--extract-structural`.
+/// Diagnostics on so the test can assert the classification.
+fn run_session_claude(extract_flag: &str) -> Output {
+    let mut cmd = Command::new(bin());
+    cmd.args([
+        extract_flag,
+        "--no-jitter",
+        "--idle-ms",
+        "300",
+        "--timeout-ms",
+        "15000",
+        "--cmd",
+        "ping",
+        "--",
+        &claude_fixture(),
+    ])
+    .env("FLAT_CYBORG_DIAG", "1")
+    .stdin(Stdio::null());
+    cmd.output().expect("spawn flat-cyborg claude session")
+}
+
 /// Asserts a session captured the fenced reply cleanly and did not self-fault.
 fn assert_clean_capture(out: &Output) {
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -220,6 +251,60 @@ fn clean_reply_then_exit_is_not_flagged_as_target_death() {
     assert!(
         !stderr.contains("exited before completing its reply"),
         "a clean reply must not emit the mid-reply-death line: {stderr:?}"
+    );
+}
+
+/// #71 review regression: a target (a known CLI) that renders a COMPLETE,
+/// chrome-free reply but drops the closing marker and THEN dies is NOT a lost
+/// reply under `--extract-structural` — the structural fallback still recovers it
+/// from the settled screen. The gate never opened (no marker) so the wrapper
+/// classifies `TargetExitedEarly`, but because the reply reached stdout the
+/// process exits 0, NOT 75. A missing closing marker must never be reported as a
+/// lost reply, or a resilience layer keyed on exit 75 would retry a call that
+/// already succeeded and discard the answer.
+#[test]
+fn target_death_after_recoverable_body_under_structural_is_success() {
+    let out = run_session_claude("--extract-structural");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a structurally-recovered marker-less reply after a mid-reply death must \
+         succeed, not report the transient (exit 75): status={:?} stderr={stderr:?}",
+        out.status
+    );
+    assert!(
+        stdout.contains("PONG_STRUCTURAL_REPLY"),
+        "the structurally-recovered reply must reach stdout: stdout={stdout:?} stderr={stderr:?}"
+    );
+    // The wrapper still classifies the EOF arm as TargetExitedEarly; only the
+    // exit-code mapping downgrades to success because the reply was recovered.
+    assert!(
+        stderr.contains("outcome=TargetExitedEarly"),
+        "expected the un-interrupted mid-reply-death classification: {stderr:?}"
+    );
+    // ...and the "reply lost" observability line is suppressed on recovery.
+    assert!(
+        !stderr.contains("exited before completing its reply"),
+        "the mid-reply-death line must be suppressed when the reply was recovered: {stderr:?}"
+    );
+}
+
+/// The strict counterpart: the SAME marker-less reply under strict `--extract`
+/// (no structural fallback) is genuinely unrecoverable, so the reply IS lost and
+/// exit 75 is the correct signal — proving the exit-0 downgrade above is driven
+/// by an actually-recovered reply, not merely by the outcome.
+#[test]
+fn target_death_marker_less_reply_under_strict_extract_is_exit_75() {
+    let out = run_session_claude("--extract");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(75),
+        "a marker-less reply strict --extract cannot recover is a lost reply \
+         (exit 75): status={:?} stderr={stderr:?}",
+        out.status
     );
 }
 

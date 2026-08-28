@@ -517,23 +517,30 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
             quiet.as_millis()
         );
     }
-    // Observability only (NOT the machine contract — that is exit 75): tell the
-    // operator the target vanished mid-reply so a bare non-zero exit is not read
-    // as a real fault. The retry-able signal is the exit code, not this string.
-    if last == Outcome::TargetExitedEarly {
-        eprintln!(
-            "flat-cyborg: the target exited before completing its reply \
-             (mid-reply exit; treated as transient, exit {EX_TEMPFAIL})"
-        );
-    }
-    print_capture(
+    // Print the reply FIRST: under --extract-structural a mid-reply death can
+    // still leave a recoverable, chrome-free reply on the settled screen. Whether
+    // one actually reached stdout decides if this was a lost reply (exit 75) or a
+    // mere missing marker (exit 0) — so it must be known before both the
+    // observability line and the exit-code mapping below.
+    let reply_recovered = print_capture(
         &wrapper,
         tui,
         sentinels_used.as_ref(),
         &program,
         args.extract_structural,
     );
-    Ok(exit_code_for(&mut wrapper, last))
+    // Observability only (NOT the machine contract — that is exit 75): tell the
+    // operator the target vanished mid-reply and its reply was LOST, so a bare
+    // non-zero exit is not read as a real fault. Suppressed when the reply was
+    // still recovered — that path exits 0, nothing transient happened. The
+    // retry-able signal is the exit code, not this string.
+    if last == Outcome::TargetExitedEarly && !reply_recovered {
+        eprintln!(
+            "flat-cyborg: the target exited before completing its reply \
+             (mid-reply exit; treated as transient, exit {EX_TEMPFAIL})"
+        );
+    }
+    Ok(exit_code_for(&mut wrapper, last, reply_recovered))
 }
 
 /// Capture mode: run the target to completion, print its sanitized output.
@@ -546,14 +553,14 @@ fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     // a chrome-filtered structural scrape for a known CLI.
     let mut wrapper = Wrapper::with_config(session, args.config);
     let outcome = wrapper.wait_until_idle()?;
-    print_capture(
+    let reply_recovered = print_capture(
         &wrapper,
         tui,
         args.extract.then(|| sentinels(0)).as_ref(),
         &program,
         args.extract_structural,
     );
-    Ok(exit_code_for(&mut wrapper, outcome))
+    Ok(exit_code_for(&mut wrapper, outcome, reply_recovered))
 }
 
 /// Prints the captured output: the rendered screen in TUI mode, otherwise the
@@ -567,36 +574,50 @@ fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
 ///
 /// The full transcript (including lines scrolled off the top in TUI mode) is
 /// used for extraction so long multi-line replies are captured whole.
+/// Returns `true` when an actual reply reached stdout (a fenced or clean
+/// structural reply under `--extract`, or the plain captured output without it),
+/// `false` when `--extract` found nothing printable. The caller uses this to
+/// decide whether a mid-reply target death actually lost the reply (exit 75) or
+/// merely dropped the closing marker while the reply was still recovered (exit 0).
 fn print_capture(
     wrapper: &Wrapper,
     tui: bool,
     sentinels: Option<&(String, String)>,
     program: &str,
     allow_structural: bool,
-) {
+) -> bool {
     if let Some((begin, end)) = sentinels {
         let text = if tui {
             wrapper.screen_full_text()
         } else {
             wrapper.clean_log()
         };
-        match extract::choose_reply(program, &text, begin, end, allow_structural) {
-            Some(s) => println!("{s}"),
+        let recovered = match extract::choose_reply(program, &text, begin, end, allow_structural) {
+            Some(s) => {
+                println!("{s}");
+                true
+            }
             // The target did not emit the markers (and, under --extract-structural,
             // no chrome-free slice was recoverable). Print nothing (never chrome)
             // and warn. Suggest the opt-in only when it is not already on.
-            None if allow_structural => eprintln!(
-                "flat-cyborg: --extract found no fenced reply and no chrome-free \
-                 structural fallback; printing nothing."
-            ),
-            None => eprintln!(
-                "flat-cyborg: --extract found no fenced reply (the target did not \
-                 emit the markers); printing nothing. Pass --extract-structural \
-                 for a best-effort structural scrape of a known CLI."
-            ),
-        }
+            None if allow_structural => {
+                eprintln!(
+                    "flat-cyborg: --extract found no fenced reply and no chrome-free \
+                     structural fallback; printing nothing."
+                );
+                false
+            }
+            None => {
+                eprintln!(
+                    "flat-cyborg: --extract found no fenced reply (the target did not \
+                     emit the markers); printing nothing. Pass --extract-structural \
+                     for a best-effort structural scrape of a known CLI."
+                );
+                false
+            }
+        };
         io::stdout().flush().ok();
-        return;
+        return recovered;
     }
     if tui {
         println!("{}", wrapper.screen_text());
@@ -604,24 +625,36 @@ fn print_capture(
         print!("{}", wrapper.clean_log());
     }
     io::stdout().flush().ok();
+    true
 }
 
-/// Reserved exit code for [`Outcome::TargetExitedEarly`]: the target closed the
-/// PTY mid-reply (un-interrupted, under an `--extract` gate that never opened).
-/// `75` is `EX_TEMPFAIL` from `sysexits.h` — "temporary failure; retry" — chosen
-/// so a resilience layer can key on a transient by contract instead of scraping
-/// stderr. It overrides the target's own passthrough status on this one arm
-/// only; every other exit code (0 / 1 / 2 / 124) keeps its existing meaning. See
-/// issue #71.
+/// Reserved exit code for a mid-reply target death whose reply was actually
+/// LOST: the target closed the PTY un-interrupted, under an `--extract` gate
+/// that never opened, AND no reply could be recovered (not even by the
+/// `--extract-structural` fallback). `75` is `EX_TEMPFAIL` from `sysexits.h` —
+/// "temporary failure; retry" — chosen so a resilience layer can key on a
+/// transient by contract instead of scraping stderr. It overrides the target's
+/// own passthrough status on this one arm only; every other exit code
+/// (0 / 1 / 2 / 124) keeps its existing meaning. Crucially, when the reply WAS
+/// recovered (a marker-less structural extraction still printed it), this is a
+/// success (exit 0), not a transient — a mere missing closing marker must never
+/// be reported as a lost reply. See issue #71.
 const EX_TEMPFAIL: u8 = 75;
 
 /// Maps a terminal [`Outcome`] to a process exit code: the target's own exit
 /// status when it completed, `124` on watchdog timeout, `75` when the target
-/// vanished mid-reply (transient; see [`EX_TEMPFAIL`]), `0` when it merely
-/// returned to an idle prompt (our commands ran; the target is still alive).
-fn exit_code_for(wrapper: &mut Wrapper, outcome: Outcome) -> ExitCode {
+/// vanished mid-reply AND the reply was lost (transient; see [`EX_TEMPFAIL`]),
+/// `0` when it returned to an idle prompt OR the mid-reply-death reply was still
+/// recovered (`reply_recovered`). `reply_recovered` reflects whether
+/// [`print_capture`] actually put a reply on stdout.
+fn exit_code_for(wrapper: &mut Wrapper, outcome: Outcome, reply_recovered: bool) -> ExitCode {
     match outcome {
         Outcome::TimedOut => ExitCode::from(124),
+        // The target vanished mid-reply. Signal the retryable transient ONLY when
+        // the reply was genuinely lost; if the structural fallback still recovered
+        // and printed it, the answer reached the caller — that is a success, and
+        // returning 75 would make a resilience layer discard a good reply (#71 review).
+        Outcome::TargetExitedEarly if reply_recovered => ExitCode::SUCCESS,
         Outcome::TargetExitedEarly => ExitCode::from(EX_TEMPFAIL),
         Outcome::Idle => ExitCode::SUCCESS,
         Outcome::Completed => {
