@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-08-29
+
 ### Added
 
 - Reserved exit code **`75`** (`EX_TEMPFAIL`, "temporary failure; retry") and a
@@ -20,8 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer from the settled screen it reaches stdout and the run exits `0`, so a
   recovered reply is never discarded as a false transient. Every other exit code
   (`0`/`1`/`2`/`124`) and plain-capture semantics (no gate → the exit stays a
-  `Completed` passthrough) are unchanged, so this is additive; a MINOR version
-  bump (0.13.0 → 0.14.0) follows in a separate release PR. A human-readable
+  `Completed` passthrough) are unchanged, so this is additive. A human-readable
   (non-contract) stderr line is also emitted on the lost-reply arm. (#71)
 
 ## [0.13.0] — 2026-08-17
@@ -153,6 +154,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `codex --extract`: single-line `wrap_command` + line-end fence integrity (#40).
 - `--paste-input`: bracketed-paste input delivery, opt-in (#49).
 
+[0.14.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.13.0...v0.14.0
 [0.12.1]: https://github.com/Replikanti/flat-cyborg/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.10.2...v0.11.0
