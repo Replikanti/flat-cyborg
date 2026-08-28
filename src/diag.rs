@@ -72,16 +72,26 @@ pub fn open_fd_count() -> isize {
     }
 }
 
-/// Emits a diagnostic record through [`emit`], deferring all formatting so a
-/// disabled build pays nothing beyond the [`enabled`] check.
+/// Emits a diagnostic record through [`emit`]. The [`enabled`] check is done
+/// FIRST, so when diagnostics are off the argument expressions are never
+/// evaluated — a disabled build pays nothing beyond the [`enabled`] check.
+///
+/// This ordering is load-bearing: some taps pass a value-producing call as an
+/// argument (e.g. [`open_fd_count`], which scans `/proc/self/fd`, or a screen
+/// read). Because `format_args!` evaluates its argument expressions eagerly, a
+/// bare `emit($cat, format_args!(...))` would run those scans on every tapped
+/// call even with diagnostics off — perturbing the very hot paths (#71) the
+/// spike observes. Gating the whole expansion on `enabled()` keeps it inert.
 ///
 /// ```ignore
-/// diag!("pty.spawn", "child_pid={pid} fds={fds}");
+/// diag!("pty.spawn", "child_pid={pid} fds={}", crate::diag::open_fd_count());
 /// ```
 #[macro_export]
 macro_rules! diag {
     ($category:expr, $($arg:tt)*) => {
-        $crate::diag::emit($category, ::std::format_args!($($arg)*))
+        if $crate::diag::enabled() {
+            $crate::diag::emit($category, ::std::format_args!($($arg)*));
+        }
     };
 }
 
@@ -94,5 +104,30 @@ mod tests {
         // Either a real Linux count (>0) or the -1 sentinel; never 0.
         let n = open_fd_count();
         assert!(n > 0 || n == -1, "unexpected fd count: {n}");
+    }
+
+    #[test]
+    fn diag_does_not_evaluate_args_when_disabled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // The lib test binary runs with FLAT_CYBORG_DIAG unset, so diagnostics
+        // are off. This pins the load-bearing invariant the #71 spike relies on:
+        // a value-producing argument (here a side-effecting counter, standing in
+        // for open_fd_count()/idle_gate_open()) is NOT evaluated when off — so
+        // the taps add nothing to the hot paths they observe. A bare
+        // `emit(_, format_args!(...))` (args eager) would fail this.
+        assert!(
+            !enabled(),
+            "test requires FLAT_CYBORG_DIAG unset (diagnostics disabled)"
+        );
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn side_effect() -> usize {
+            CALLS.fetch_add(1, Ordering::SeqCst)
+        }
+        crate::diag!("test.gate", "n={}", side_effect());
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            0,
+            "diag! evaluated its argument while diagnostics were disabled"
+        );
     }
 }
