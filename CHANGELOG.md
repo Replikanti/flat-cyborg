@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Transcript-based reply recovery for `--extract`.** Under `--extract` with a
+  claude target, the sentinel-fenced reply is now recovered from claude's own
+  turn transcript (`~/.claude/projects/<proj>/<session>.jsonl`) **first**, with
+  the rendered screen only a fallback. The transcript holds the whole reply
+  regardless of how the TUI renders it, so replies too long to fit — or collapsed
+  off — the screen (newer claude collapses long output behind a "+N lines"
+  affordance, which the screen scrape cannot recover) are captured intact. New
+  `--transcript-dir <DIR>` overrides the default `$HOME/.claude/projects`;
+  `--no-transcript-read` disables recovery (screen scraping only). Recovery keys
+  on the run's unique sentinel, so it is immune to path sanitization and
+  concurrent sessions; it no-ops (falling through to the screen path) when the
+  target is not claude, transcript saving is off, or no fence is present.
+
 ## [0.14.0] — 2026-08-29
 
 ### Added
