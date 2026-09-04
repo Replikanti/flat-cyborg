@@ -354,6 +354,130 @@ fn last_marker_at_line_end(text: &str, marker: &str, limit: usize) -> Option<usi
     None
 }
 
+/// Reads four hex digits from `chars` as a `\uXXXX` code unit. `None` if fewer
+/// than four hex digits are available (a truncated escape).
+fn take_hex4(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<u16> {
+    let mut v: u16 = 0;
+    for _ in 0..4 {
+        let d = chars.next()?.to_digit(16)?;
+        v = v.checked_mul(16)?.checked_add(d as u16)?;
+    }
+    Some(v)
+}
+
+/// Unescapes a JSON string body (the characters between the quotes) into real
+/// text: the standard `\n \t \r \" \\ \/ \b \f` escapes plus `\uXXXX`,
+/// including surrogate pairs. An unknown or truncated escape keeps its trailing
+/// character verbatim — a transcript slice is data to recover, not to validate,
+/// so lenience never loses payload.
+pub(crate) fn json_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('b') => out.push('\u{08}'),
+            Some('f') => out.push('\u{0C}'),
+            Some('u') => match take_hex4(&mut chars) {
+                // A high surrogate combines with a following `\uXXXX` low
+                // surrogate into one astral codepoint (emoji etc.).
+                Some(hi) if (0xD800..=0xDBFF).contains(&hi) => {
+                    if chars.peek() == Some(&'\\') {
+                        chars.next();
+                        if chars.next() == Some('u') {
+                            if let Some(lo) = take_hex4(&mut chars) {
+                                let cp = 0x1_0000
+                                    + ((u32::from(hi) - 0xD800) << 10)
+                                    + (u32::from(lo) - 0xDC00);
+                                if let Some(ch) = char::from_u32(cp) {
+                                    out.push(ch);
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(cu) => {
+                    if let Some(ch) = char::from_u32(u32::from(cu)) {
+                        out.push(ch);
+                    }
+                }
+                None => {}
+            },
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Collects the unescaped body of every `"text":"…"` JSON string value on one
+/// JSONL line (a content array may hold several text blocks alongside thinking
+/// or tool blocks; only `text` blocks carry the reply). Scans byte offsets,
+/// which is UTF-8-safe because the only structural bytes it inspects (`"` and
+/// `\`) never occur inside a multi-byte UTF-8 sequence, and it slices only at
+/// those ASCII bounds.
+fn text_values(line: &str) -> Vec<String> {
+    const KEY: &str = "\"text\":\"";
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut search = 0usize;
+    while let Some(rel) = line[search..].find(KEY) {
+        let start = search + rel + KEY.len();
+        let mut i = start;
+        let mut esc = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                break;
+            }
+            i += 1;
+        }
+        out.push(json_unescape(&line[start..i]));
+        search = i + 1;
+    }
+    out
+}
+
+/// Recovers a sentinel-fenced reply from a claude JSONL transcript's raw text.
+///
+/// claude persists each turn to `~/.claude/projects/<dir>/<session>.jsonl`, one
+/// JSON object per line, with the reply carried in an assistant `text` block.
+/// This finds the string value holding the run's unique `begin` sentinel,
+/// JSON-unescapes it so the fenced `\n`s become real line breaks, then slices
+/// the reply with the same [`extract_between`] the screen path uses. It is
+/// independent of how the target's TUI renders: it recovers replies too long to
+/// fit (or collapsed off) the rendered screen — exactly the case the screen
+/// scrape cannot. `None` when no line carries a well-formed fence for `begin`.
+pub(crate) fn reply_from_jsonl_text(content: &str, begin: &str, end: &str) -> Option<String> {
+    for line in content.lines() {
+        if !line.contains(begin) {
+            continue;
+        }
+        // A line may hold several text blocks (and thinking/tool blocks that can
+        // even mention the sentinel mid-prose); the fence lives in exactly one,
+        // so try each and let the self-validating fence pick the real reply.
+        for text in text_values(line) {
+            if let Some(reply) = extract_between(&text, begin, end) {
+                return Some(reply);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,5 +790,76 @@ mod tests {
         let reply_struct = choose_reply("claude", transcript, begin, end, true)
             .expect("fence must win regardless of allow_structural");
         assert_eq!(reply_struct.trim(), "2+2 equals 4.");
+    }
+
+    #[test]
+    fn json_unescape_handles_standard_and_unicode_escapes() {
+        assert_eq!(json_unescape(r"a\nb\tc\rd"), "a\nb\tc\rd");
+        assert_eq!(json_unescape(r#"q \" b \\ s \/"#), "q \" b \\ s /");
+        // λ (U+03BB) + combining tilde (U+0303) — the shape in Twyne's math comments.
+        assert_eq!(json_unescape(r"λ̃"), "\u{03bb}\u{0303}");
+        // Astral codepoint via a surrogate pair (😀 U+1F600).
+        assert_eq!(json_unescape(r"😀"), "\u{1f600}");
+        // Unknown escape keeps the trailing char; a bare backslash is dropped, no panic.
+        assert_eq!(json_unescape(r"\x41"), "x41");
+        assert_eq!(json_unescape("plain text"), "plain text");
+    }
+
+    #[test]
+    fn jsonl_reply_recovers_fenced_block() {
+        let begin = "FCB_7f_BEGIN";
+        let end = "FCB_7f_END";
+        // An assistant line as claude persists it: reply in a `text` block with
+        // the fence newlines JSON-escaped (`\n` = the two chars backslash-n here).
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"FCB_7f_BEGIN\nhello \"world\"\nFCB_7f_END"}]}}"#;
+        let reply = reply_from_jsonl_text(line, begin, end).expect("fence recovered from jsonl");
+        assert_eq!(reply, "hello \"world\"");
+    }
+
+    #[test]
+    fn jsonl_reply_recovers_long_reply_a_screen_would_miss() {
+        let begin = "FCB_ab_BEGIN";
+        let end = "FCB_ab_END";
+        // 40 fenced lines — the exact shape that overflows / collapses off a
+        // rendered screen, the case the screen scrape cannot recover.
+        let mut inner = String::from(begin);
+        for i in 1..=40 {
+            inner.push_str("\\n"); // JSON-escaped newline
+            inner.push_str(&format!("line {i}"));
+        }
+        inner.push_str("\\n");
+        inner.push_str(end);
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{inner}"}}]}}}}"#
+        );
+        let reply = reply_from_jsonl_text(&line, begin, end).expect("long fenced reply recovered");
+        assert_eq!(reply.lines().count(), 40);
+        assert!(reply.starts_with("line 1\n"), "reply: {reply:?}");
+        assert!(reply.ends_with("\nline 40"), "reply: {reply:?}");
+    }
+
+    #[test]
+    fn jsonl_reply_skips_stale_turns_and_prose_mentions() {
+        let begin = "FCB_c3_BEGIN";
+        let end = "FCB_c3_END";
+        // A stale prior turn (no sentinel) and, on the real turn, a text block
+        // that only MENTIONS the sentinel in prose (no closing fence) precede the
+        // fenced reply; the self-validating fence must pick the real reply block.
+        let content = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"an older unrelated reply"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I will wrap it in FCB_c3_BEGIN as instructed"},{"type":"text","text":"FCB_c3_BEGIN\nthe answer\nFCB_c3_END"}]}}"#,
+        );
+        let reply = reply_from_jsonl_text(content, begin, end).expect("fenced reply recovered");
+        assert_eq!(reply, "the answer");
+    }
+
+    #[test]
+    fn jsonl_reply_is_none_when_sentinel_absent() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"no fence here"}]}}"#;
+        assert_eq!(
+            reply_from_jsonl_text(line, "FCB_missing_BEGIN", "FCB_missing_END"),
+            None
+        );
     }
 }

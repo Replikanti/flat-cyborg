@@ -86,6 +86,17 @@ OPTIONS:
                         screen (the pre-0.13.0 --extract-structural behavior).
                         With strict --extract there is no grace unless this flag
                         sets one.
+    --transcript-dir <DIR>
+                        Directory of the target's own reply transcripts (default
+                        $HOME/.claude/projects). Under --extract with a claude
+                        target, the sentinel-fenced reply is recovered from the
+                        transcript FIRST — it is authoritative and immune to how
+                        the TUI renders long replies (newer claude collapses long
+                        output off-screen, which the screen scrape then misses).
+                        The rendered screen stays the fallback.
+    --no-transcript-read
+                        Disable transcript recovery; extract from the rendered
+                        screen only (the pre-transcript behavior).
     --no-jitter         Write each --cmd as a single burst with no per-keystroke
                         human-cadence delay. The default jitter types one char
                         at a time (40-300 ms each), which is minutes for a
@@ -124,6 +135,13 @@ struct Args {
     /// `--extract-grace-ms`: explicit marker-less grace for the IDLE gate.
     /// `None` = not given (the mode's default applies, see [`idle_gate_for`]).
     extract_grace: Option<Duration>,
+    /// Directory of the target's own reply transcripts (claude:
+    /// `~/.claude/projects`). Under `--extract` with a claude target, the
+    /// sentinel-fenced reply is recovered from there FIRST (it is authoritative
+    /// and immune to how the TUI renders long replies), the rendered screen only
+    /// a fallback. `None` = disabled (`--no-transcript-read`, or a non-claude /
+    /// no-`--extract` run). Defaults to `$HOME/.claude/projects`.
+    transcript_dir: Option<String>,
     cwd: Option<String>,
     program: String,
     program_args: Vec<String>,
@@ -180,6 +198,8 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
     let mut extract = false;
     let mut extract_structural = false;
     let mut extract_grace: Option<Duration> = None;
+    let mut transcript_dir: Option<String> = None;
+    let mut transcript_off = false;
     let mut cwd: Option<String> = None;
 
     let mut i = 0;
@@ -255,6 +275,12 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
                     .map_err(|_| format!("invalid --extract-grace-ms: {v}"))?;
                 extract_grace = Some(Duration::from_millis(ms));
             }
+            // Where the target persists its own reply transcript (default
+            // `$HOME/.claude/projects`). Under --extract with claude, the fenced
+            // reply is read from there first (see Args::transcript_dir).
+            "--transcript-dir" => transcript_dir = Some(take_value("--transcript-dir")?),
+            // Opt OUT of transcript recovery; fall back to screen scraping only.
+            "--no-transcript-read" => transcript_off = true,
             "--no-jitter" => config.burst_input = true,
             "--paste-input" => config.paste_input = true,
             "--wrap-input" => {
@@ -280,12 +306,34 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
         }
     }
 
+    // Resolve the transcript directory: an explicit --transcript-dir wins; else,
+    // for an --extract run (transcript recovery is a reply-extraction aid),
+    // default to `$HOME/.claude/projects`. --no-transcript-read forces it off.
+    // A missing dir is not an error here — recovery just no-ops and the screen
+    // path runs, so a non-claude target or absent transcript stays harmless.
+    let transcript_dir = if transcript_off {
+        None
+    } else if transcript_dir.is_some() {
+        transcript_dir
+    } else if extract {
+        std::env::var_os("HOME").map(|home| {
+            std::path::Path::new(&home)
+                .join(".claude")
+                .join("projects")
+                .to_string_lossy()
+                .into_owned()
+        })
+    } else {
+        None
+    };
+
     Ok(Mode::Run(Box::new(Args {
         cmds,
         config,
         extract,
         extract_structural,
         extract_grace,
+        transcript_dir,
         cwd,
         program: rest[0].clone(),
         program_args: rest[1..].to_vec(),
@@ -461,6 +509,11 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
     let program = args.program.clone();
     let idle_silence = args.config.idle_silence;
     let exec_timeout = args.config.exec_timeout;
+    let extract_structural = args.extract_structural;
+    let transcript_dir = args.transcript_dir.clone();
+    // Recovery only considers transcript files touched from here on, so a stale
+    // session that happens to reuse a sentinel token can never be picked up.
+    let since = std::time::SystemTime::now();
     let mut wrapper = Wrapper::with_config(session, args.config);
     let mut last = Outcome::Completed;
     // The last command's sentinel pair — what the final capture is extracted
@@ -527,7 +580,9 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
         tui,
         sentinels_used.as_ref(),
         &program,
-        args.extract_structural,
+        extract_structural,
+        transcript_dir.as_deref(),
+        since,
     );
     // Observability only (NOT the machine contract — that is exit 75): tell the
     // operator the target vanished mid-reply and its reply was LOST, so a bare
@@ -559,6 +614,10 @@ fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
         args.extract.then(|| sentinels(0)).as_ref(),
         &program,
         args.extract_structural,
+        // Capture mode never wraps/sends a sentinel command, so there is no
+        // fenced reply to recover from a transcript — screen path only.
+        None,
+        std::time::SystemTime::now(),
     );
     Ok(exit_code_for(&mut wrapper, outcome, reply_recovered))
 }
@@ -585,8 +644,23 @@ fn print_capture(
     sentinels: Option<&(String, String)>,
     program: &str,
     allow_structural: bool,
+    transcript_dir: Option<&str>,
+    since: std::time::SystemTime,
 ) -> bool {
     if let Some((begin, end)) = sentinels {
+        // Authoritative source FIRST: the target's own reply transcript captures
+        // the whole reply regardless of how its TUI renders long output — newer
+        // claude collapses long replies off the rendered screen, which the screen
+        // scrape below then cannot recover. Falls through to the screen path when
+        // no transcript carries the fence (transcript saving off, target is not
+        // claude, or the reply never completed).
+        if let Some(dir) = transcript_dir {
+            if let Some(reply) = reply_from_transcript(dir, program, begin, end, since) {
+                println!("{reply}");
+                io::stdout().flush().ok();
+                return true;
+            }
+        }
         let text = if tui {
             wrapper.screen_full_text()
         } else {
@@ -626,6 +700,63 @@ fn print_capture(
     }
     io::stdout().flush().ok();
     true
+}
+
+/// Recovers the fenced reply for `begin`/`end` from the target's own transcript
+/// files under `dir` (claude persists each turn to
+/// `~/.claude/projects/<proj>/<session>.jsonl`). Only attempted for a claude
+/// target. Scans `*.jsonl` one level under `dir` whose mtime lands in a window
+/// around/after `since` — the sentinel is unique per run, so the window is only
+/// a scan bound, not a correctness filter — newest first, and returns the first
+/// sentinel-fenced reply found. `None` when the target is not claude, `dir` is
+/// unreadable, or no transcript carries the fence (e.g. transcript saving off).
+fn reply_from_transcript(
+    dir: &str,
+    program: &str,
+    begin: &str,
+    end: &str,
+    since: std::time::SystemTime,
+) -> Option<String> {
+    if std::path::Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        != Some("claude")
+    {
+        return None;
+    }
+    // Widen the mtime floor generously: correctness rides on the unique sentinel,
+    // so this only avoids reading long-dead transcripts.
+    let window = since
+        .checked_sub(Duration::from_secs(300))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    for proj in std::fs::read_dir(dir).ok()?.flatten() {
+        let Ok(sessions) = std::fs::read_dir(proj.path()) else {
+            continue;
+        };
+        for entry in sessions.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if mtime >= window {
+                files.push((mtime, path));
+            }
+        }
+    }
+    files.sort_by_key(|f| std::cmp::Reverse(f.0)); // newest first
+    for (_, path) in files {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Some(reply) = extract::reply_from_jsonl_text(&content, begin, end) {
+                return Some(reply);
+            }
+        }
+    }
+    None
 }
 
 /// Reserved exit code for a mid-reply target death whose reply was actually
