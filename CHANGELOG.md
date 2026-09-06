@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.16.0] — 2026-09-06
 
 ### Added
 
@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--cols <N>` (40-4000) sets the width; `$FLAT_CYBORG_COLS` is the default for
   drivers with a fixed argv builder, and an explicit flag wins over it. Default
   stays 120 — unchanged behavior unless set.
+
+## [Unreleased]
 
 ## [0.15.0] — 2026-09-04
 
@@ -190,3 +192,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.10.2]: https://github.com/Replikanti/flat-cyborg/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/Replikanti/flat-cyborg/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Replikanti/flat-cyborg/releases/tag/v0.10.0
+[0.16.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.14.0...v0.15.0
