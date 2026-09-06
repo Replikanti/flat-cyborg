@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--cols <N>` / `$FLAT_CYBORG_COLS` — configurable PTY width.** The target's
+  PTY (and the `--tui` screen grid) was fixed at 120 columns, so an Ink-style
+  TUI soft-wrapped every reply line longer than that with a hanging indent and
+  a screen-read `--extract` reply came back re-wrapped: a long `|`-delimited
+  protocol line lost its trailing fields to the continuation lines (observed on
+  a verbose model whose one-line classification reply ran past 120 columns).
+  `--cols <N>` (40-4000) sets the width; `$FLAT_CYBORG_COLS` is the default for
+  drivers with a fixed argv builder, and an explicit flag wins over it. Default
+  stays 120 — unchanged behavior unless set.
+
 ## [0.15.0] — 2026-09-04
 
 ### Added

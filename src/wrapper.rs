@@ -93,6 +93,13 @@ pub struct WrapperConfig {
     /// [`Self::burst_input`]; off by default. Takes precedence over `burst_input`
     /// when both are set. (`wrap_input` folding is unnecessary under paste.)
     pub paste_input: bool,
+    /// Width of the target's PTY (and of the `--tui` screen grid), in columns
+    /// (the `--cols <N>` flag; default [`DEFAULT_COLS`]). An Ink-style TUI
+    /// soft-wraps any reply line longer than the terminal at word boundaries
+    /// with a hanging indent, so a screen-scraped `--extract` reply comes back
+    /// re-wrapped; a wider PTY keeps a long single-line reply (a `|`-delimited
+    /// protocol line, say) on one line.
+    pub cols: u16,
 }
 
 impl Default for WrapperConfig {
@@ -113,6 +120,7 @@ impl Default for WrapperConfig {
             wrap_input: 0,
             idle_gate: None,
             paste_input: false,
+            cols: DEFAULT_COLS,
         }
     }
 }
@@ -233,9 +241,9 @@ impl Wrapper {
 
     /// Wraps `session` with an explicit configuration.
     pub fn with_config(session: PtySession, config: WrapperConfig) -> Self {
-        // The grid matches the session's default PTY geometry; only needed in
-        // TUI mode.
-        let screen = config.tui.then(|| Screen::new(DEFAULT_ROWS, DEFAULT_COLS));
+        // The grid matches the session's PTY geometry (`config.cols` wide);
+        // only needed in TUI mode.
+        let screen = config.tui.then(|| Screen::new(DEFAULT_ROWS, config.cols));
         Self {
             session,
             sanitizer: Sanitizer::new(),

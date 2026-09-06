@@ -52,6 +52,11 @@ OPTIONS:
     --no-confirm        Do not auto-answer [y/n] confirmation prompts.
     --cwd <DIR>         Run the target with this working directory (default:
                         inherit flat-cyborg's).
+    --cols <N>          PTY width for the target, in columns (default 120, or
+                        $FLAT_CYBORG_COLS when set; 40-4000). A TUI soft-wraps
+                        reply lines longer than the terminal, so a screen-read
+                        --extract reply comes back re-wrapped; widen the PTY to
+                        keep long single-line replies whole.
     --auto-approve      Auto-confirm agent approval menus (e.g. codex git-push,
                         claude trust). Bypasses the agent's safety gates —
                         opt-in. Off by default.
@@ -159,6 +164,19 @@ fn parse_args() -> Result<Mode, String> {
     parse_from(std::env::args().skip(1).collect())
 }
 
+/// Bounds for `--cols` / `$FLAT_CYBORG_COLS`: narrower than 40 breaks every
+/// TUI's layout, wider than 4000 is a typo, not a terminal.
+const MIN_COLS: u16 = 40;
+const MAX_COLS: u16 = 4000;
+
+/// Parses a PTY width, rejecting anything outside [`MIN_COLS`]..=[`MAX_COLS`].
+fn parse_cols(v: &str) -> Result<u16, ()> {
+    match v.trim().parse::<u16>() {
+        Ok(c) if (MIN_COLS..=MAX_COLS).contains(&c) => Ok(c),
+        _ => Err(()),
+    }
+}
+
 /// Pure arg-parsing core, split out so it can be unit-tested without touching
 /// the process-global `std::env::args`.
 fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
@@ -194,6 +212,11 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
     let mut has_cmd = false;
     let mut has_cmd_file = false;
     let mut config = WrapperConfig::default();
+    // `$FLAT_CYBORG_COLS` is the width default for drivers that cannot pass
+    // flags (a fixed argv builder); an explicit `--cols` still wins below.
+    if let Ok(v) = std::env::var("FLAT_CYBORG_COLS") {
+        config.cols = parse_cols(&v).map_err(|_| format!("invalid $FLAT_CYBORG_COLS: {v}"))?;
+    }
     let mut prompts: Vec<String> = Vec::new();
     let mut extract = false;
     let mut extract_structural = false;
@@ -249,6 +272,10 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
             "--no-confirm" => config.auto_confirm = false,
             "--auto-approve" => config.auto_approve = true,
             "--cwd" => cwd = Some(take_value("--cwd")?),
+            "--cols" => {
+                let v = take_value("--cols")?;
+                config.cols = parse_cols(&v).map_err(|_| format!("invalid --cols: {v}"))?;
+            }
             "--tui" => config.tui = true,
             // --extract structurally needs the 2D screen grid: its transcript is
             // the screen's full_text (scrollback included), and a full-screen
@@ -485,7 +512,7 @@ fn run(args: Args) -> flat_cyborg::Result<ExitCode> {
         &args.program_args,
         args.cwd.as_deref().map(std::path::Path::new),
         flat_cyborg::pty::DEFAULT_ROWS,
-        flat_cyborg::pty::DEFAULT_COLS,
+        args.config.cols,
     )?;
 
     if !args.cmds.is_empty() {
@@ -1015,6 +1042,42 @@ mod tests {
         let w = wrap_command("do a thing", "B_BEGIN", "B_END");
         assert!(!w.contains('\n'), "wrap_command must be single-line: {w:?}");
         assert!(w.contains("IMPORTANT"));
+    }
+
+    #[test]
+    fn cols_flag_sets_pty_width_and_defaults_to_120() {
+        // Default stays the historical 120-column PTY; `--cols` overrides it
+        // (this test does not set $FLAT_CYBORG_COLS, so the default applies).
+        let m =
+            parse_from(vec!["--cmd".into(), "hi".into(), "--".into(), "sh".into()]).expect("parse");
+        match m {
+            Mode::Run(a) => assert_eq!(a.config.cols, flat_cyborg::pty::DEFAULT_COLS),
+            other => panic!("expected Run, got {other:?}"),
+        }
+        let m = parse_from(vec![
+            "--cols".into(),
+            "600".into(),
+            "--cmd".into(),
+            "hi".into(),
+            "--".into(),
+            "sh".into(),
+        ])
+        .expect("parse");
+        match m {
+            Mode::Run(a) => assert_eq!(a.config.cols, 600),
+            other => panic!("expected Run, got {other:?}"),
+        }
+        for bad in ["0", "39", "4001", "wide", ""] {
+            let r = parse_from(vec![
+                "--cols".into(),
+                bad.into(),
+                "--cmd".into(),
+                "hi".into(),
+                "--".into(),
+                "sh".into(),
+            ]);
+            assert!(r.is_err(), "--cols {bad:?} must be rejected");
+        }
     }
 
     #[test]
