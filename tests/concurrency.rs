@@ -15,6 +15,7 @@
 
 use std::process::{Command, Output, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// The wrapper binary under test.
 fn bin() -> &'static str {
@@ -390,5 +391,148 @@ fn stress_many_concurrent_sessions() {
     assert_eq!(
         failures, 0,
         "{failures} concurrent sessions failed across {ITERS} iterations of N={N}"
+    );
+}
+
+/// Drives one `flat-cyborg` session against the never-settling `ANIMATE_FOREVER`
+/// fixture with an OWN in-test kill deadline, returning the child's `Output` plus
+/// the observed wall-clock. The deadline is a safety net, not the assertion: a
+/// correctly-bounded wait exits FAR sooner. If the deadline is hit the wrapper is
+/// killed and the test panics — a regression to an unbounded wait can never hang
+/// CI. `extra_args` are inserted before `--cmd` (e.g. the `--hard-timeout-ms`
+/// knob); `env` carries the fixture + diagnostics knobs.
+fn run_animating_bounded(
+    extra_args: &[&str],
+    timeout_ms: &str,
+    env: &[(&str, &str)],
+    deadline: Duration,
+) -> (Output, Duration) {
+    let mut cmd = Command::new(bin());
+    cmd.arg("--extract")
+        .arg("--no-jitter")
+        .arg("--idle-ms")
+        .arg("300")
+        .arg("--timeout-ms")
+        .arg(timeout_ms)
+        .args(extra_args)
+        .args(["--cmd", "ping", "--", "sh", &fixture()])
+        .env("ANIMATE_FOREVER", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let start = Instant::now();
+    let mut child = cmd.spawn().expect("spawn flat-cyborg session");
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            break;
+        }
+        if start.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "flat-cyborg did not self-bound within {deadline:?} against a \
+                 never-settling animating target — the wait is unbounded (regression)"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let elapsed = start.elapsed();
+    let out = child
+        .wait_with_output()
+        .expect("collect flat-cyborg output");
+    (out, elapsed)
+}
+
+/// M1 (spike) — classify the hang arm. Against a target that repaints forever and
+/// never fences its reply, the `Output::Idle` completion arm can never fire, so
+/// the ONLY thing that ends the wait is the graceful watchdog at `--timeout-ms`:
+/// the run rides to it and exits `124`. This pins the confirmed arm — completion
+/// never fires (`idle=0`), the watchdog is NOT starved (`watchdog_fired=true`) —
+/// the evidence the #81 hard-cap fix is built on.
+///
+/// The hard cap is raised WELL ABOVE `--timeout-ms` here so the graceful watchdog
+/// (not the cap, whose CLI default equals `--timeout-ms`) is the arm exercised —
+/// this test is about the classification of the pre-cap arm, `animating_target_hits_wall_clock_cap`
+/// covers the cap firing.
+#[test]
+fn animating_target_never_completes_via_grace() {
+    let (out, elapsed) = run_animating_bounded(
+        &["--hard-timeout-ms", "60000"],
+        "1500",
+        &[("FLAT_CYBORG_DIAG", "1")],
+        Duration::from_secs(20),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "a never-settling target must ride to the watchdog (124): status={:?} \
+         stderr_tail={:?}",
+        out.status,
+        stderr.lines().rev().take(6).collect::<Vec<_>>()
+    );
+    assert!(
+        stderr.contains("wrapper.watchdog-interrupt"),
+        "the graceful watchdog must fire (arm b is NOT starved): {stderr:?}"
+    );
+    // The LAST loop-exit is the reply wait (the first is the pre-typing readiness
+    // wait, which settles on the banner BEFORE the animation loop even starts).
+    let loop_exit = stderr
+        .lines()
+        .rev()
+        .find(|l| l.contains("wrapper.loop-exit"))
+        .unwrap_or_else(|| panic!("no wrapper.loop-exit record in: {stderr:?}"));
+    assert!(
+        loop_exit.contains("idle=0"),
+        "completion arm must never fire (arm a confirmed): {loop_exit:?}"
+    );
+    assert!(
+        loop_exit.contains("watchdog_fired=true"),
+        "the watchdog must be the arm that bounds the wait: {loop_exit:?}"
+    );
+    // The watchdog DID bound it, but only after burning the whole --timeout-ms.
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "the wait rode to the full --timeout-ms before the watchdog: {elapsed:?}"
+    );
+}
+
+/// M2 (fix) — the absolute wall-clock cap. With `--hard-timeout-ms` set well
+/// BELOW `--timeout-ms`, the same never-settling target is hard-capped at the
+/// ceiling and exits with the reserved `69` (EX_UNAVAILABLE), long before the
+/// watchdog's `--timeout-ms` would fire. The cap is checked regardless of the
+/// `Output` variant, so a target that never yields `Idle`/`Eof` is still bounded.
+#[test]
+fn animating_target_hits_wall_clock_cap() {
+    let (out, elapsed) = run_animating_bounded(
+        &["--hard-timeout-ms", "1500"],
+        "60000",
+        &[("FLAT_CYBORG_DIAG", "1")],
+        Duration::from_secs(20),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(69),
+        "the hard cap must return the reserved exit code 69: status={:?} \
+         stderr_tail={:?}",
+        out.status,
+        stderr.lines().rev().take(6).collect::<Vec<_>>()
+    );
+    assert!(
+        stderr.contains("wrapper.hardcap"),
+        "the hard-cap diagnostic must be present: {stderr:?}"
+    );
+    // Fired at the cap (~1.5 s), NOT at the 60 s --timeout-ms watchdog.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the cap must fire at ~--hard-timeout-ms, well before --timeout-ms: {elapsed:?}"
+    );
+    assert!(
+        !stderr.contains("wrapper.watchdog-interrupt"),
+        "the hard cap must pre-empt the graceful watchdog: {stderr:?}"
     );
 }

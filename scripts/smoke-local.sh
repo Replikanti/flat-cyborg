@@ -44,9 +44,17 @@ out=$(printf '' | "$BIN" --idle-ms 300 --timeout-ms 8000 \
 # echo + the shell echoing the typed command => the marker appears at least once.
 if [ "$out" -ge 1 ]; then check "S2 orchestrator" "ge1" "ge1"; else check "S2 orchestrator" "ge1" "$out"; fi
 
-# S3: watchdog aborts a hung target with exit code 124.
-printf '' | "$BIN" --idle-ms 300 --timeout-ms 1500 -- sh -c 'sleep 30' >/dev/null 2>&1
+# S3: the graceful watchdog aborts a hung target with exit code 124. The hard
+# cap is raised above --timeout-ms so the graceful watchdog (not the hard cap,
+# whose default equals --timeout-ms) is the arm exercised here.
+printf '' | "$BIN" --idle-ms 300 --timeout-ms 1500 --hard-timeout-ms 30000 \
+  -- sh -c 'sleep 30' >/dev/null 2>&1
 check "S3 watchdog-124" "124" "$?"
+
+# S3b: the absolute hard cap (default = --timeout-ms) bounds a hung target with
+# an immediate SIGKILL and the reserved exit code 69, pre-empting the watchdog.
+printf '' | "$BIN" --idle-ms 300 --timeout-ms 1500 -- sh -c 'sleep 30' >/dev/null 2>&1
+check "S3b hardcap-69" "69" "$?"
 
 # S4: --cwd runs the target in the given directory.
 out=$(printf '' | "$BIN" --cwd /tmp -- sh -c 'pwd')

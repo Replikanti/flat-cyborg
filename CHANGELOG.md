@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`--hard-timeout-ms <N>` / `$FLAT_CYBORG_HARD_TIMEOUT_MS` — absolute
+  wall-clock cap.** The graceful `--timeout-ms` watchdog only bounds a run whose
+  completion path can fire; a target that repaints a spinner or "thinking" hint
+  continuously never settles, so `Output::Idle` never fires and the reply wait
+  rides the full `--timeout-ms` before the watchdog aborts it with an ambiguous,
+  non-retryable `124`. The new hard cap is checked at the top of every wait
+  iteration regardless of output state, so it fires even under continuous data:
+  on breach the target is SIGKILLed immediately (no graceful `Ctrl+C`) and the
+  run exits `69` (`EX_UNAVAILABLE`), a retryable transient distinct from `124`.
+  Defaults to `--timeout-ms` so the intended `T_max` fires unconditionally;
+  `$FLAT_CYBORG_HARD_TIMEOUT_MS` is the default for drivers with a fixed argv
+  builder, and an explicit flag wins over it. (#81)
+
 ## [0.16.0] — 2026-09-06
 
 ### Added

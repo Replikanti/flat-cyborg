@@ -77,7 +77,8 @@ flat-cyborg picks a mode automatically:
 |------|-------------|
 | `--cmd <TEXT>` | Type `TEXT` into the target (repeatable). Selects orchestrator mode. |
 | `--cmd-file <PATH>` | Like `--cmd` but read the prompt text from `PATH`. Use for large prompts: a multi-megabyte prompt passed as an argv value overflows `ARG_MAX` (the `Argument list too long` limit); a file does not. Repeatable, combines with `--cmd`; selects orchestrator mode. |
-| `--timeout-ms <N>` | Per-operation execution timeout before the watchdog intervenes (default 60000). |
+| `--timeout-ms <N>` | Per-operation execution timeout before the **graceful** watchdog intervenes (default 60000): on expiry it sends `Ctrl+C`, waits a grace, then SIGKILLs (exit `124`). |
+| `--hard-timeout-ms <N>` | Absolute per-operation wall-clock ceiling (default: equal to `--timeout-ms`, or `$FLAT_CYBORG_HARD_TIMEOUT_MS` when set). Unlike `--timeout-ms` this is checked **regardless of output state**, so it bounds even a continuously-animating TUI that never settles — where the `--timeout-ms` completion path can never fire and the reply wait would otherwise ride the full timeout. On breach the target is SIGKILLed immediately (no graceful `Ctrl+C`) and the run exits `69` (`EX_UNAVAILABLE`), a **retryable transient** distinct from the watchdog's ambiguous `124`. Applies per operation, like `--timeout-ms`. The env form exists for drivers with a fixed argv builder; an explicit flag wins over it. |
 | `--idle-ms <N>` | How long output must be silent before the target is considered idle (default 500). Raise it for slow or animated targets. Under `--extract` it is a **latency** knob, not a correctness one: completion is gated on the model's closing marker, so a think-pause longer than `--idle-ms` no longer cuts the reply short (see [Completion: what ends the reply wait](#completion-what-ends-the-reply-wait)). |
 | `--prompt <TOKEN>` | Trailing prompt token that marks idle (repeatable; defaults to common shell prompts `$ `, `# `, `> `, `% `). |
 | `--no-confirm` | Do not auto-answer `[y/n]` confirmation prompts (by default they are answered `y`). |
@@ -200,6 +201,14 @@ completes, but only after the output has been continuously quiet for
 - Strict `--extract` has no grace unless you pass one: with no structural
   fallback there is nothing to recover from a marker-less run anyway, and the
   watchdog is the backstop.
+- **A never-settling animating TUI is bounded by the hard cap, not the grace.**
+  The grace (and the whole settle path) only fires once the output falls quiet;
+  a target that repaints continuously — an animated spinner or "thinking" hint
+  that never stops — never settles, so `Output::Idle` never fires and the reply
+  wait rides the full `--timeout-ms`. `--hard-timeout-ms` (default: equal to
+  `--timeout-ms`) is the absolute wall-clock bound checked regardless of output
+  state, so this case ends promptly at the cap with a retryable exit `69`
+  instead of the graceful watchdog's `124`.
 - `--extract-grace-ms 0` restores the pre-0.13.0 `--extract-structural`
   behavior (the first settled screen completes the run) — an escape hatch and
   an A/B control arm.
@@ -311,6 +320,7 @@ does not, or when you specifically need the interactive path.
 | target's code | In capture/orchestrator mode, the target's own exit status is propagated. |
 | `1` | Generic failure — flat-cyborg itself failed (e.g. the target could not be spawned), or the target was killed by a signal. |
 | `2` | Usage error (bad arguments). |
+| `69` | The absolute hard cap (`--hard-timeout-ms`) fired — the target streamed continuously and never fenced (or settled) its reply within the ceiling, so it was SIGKILLed immediately (no graceful `Ctrl+C`). `69` is `EX_UNAVAILABLE`: a **retryable transient**, distinct from the watchdog's ambiguous `124`. This is the bound that fires under a never-settling animating TUI, where the `--timeout-ms` completion path cannot. |
 | `75` | The target exited **mid-reply** and the reply was **lost** — it closed the PTY, un-interrupted, under `--extract` with the gate never opened, and no reply could be recovered (not even by the `--extract-structural` fallback). `75` is `EX_TEMPFAIL` ("temporary failure; retry"): a **transient** the caller may re-run. It overrides the target's own passthrough status on this arm only. A missing closing marker alone is **not** a lost reply: if `--extract-structural` still recovers the answer from the settled screen it returns `0`; a clean reply-then-exit returns `0`; and plain capture (no `--extract`) keeps propagating the target's own code. |
 | `124` | The watchdog timed out and aborted the operation. |
 

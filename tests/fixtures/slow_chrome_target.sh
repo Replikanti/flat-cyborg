@@ -19,6 +19,12 @@
 #                   marker instead of lingering at the idle prompt (models a
 #                   target that answers cleanly then quits — must NOT be flagged
 #                   as a mid-reply death)
+#   ANIMATE_FOREVER if "1", after reading the prompt repaint a *changing* spinner
+#                   frame forever (faster than any poll interval), NEVER printing
+#                   the closing sentinel, NEVER settling, NEVER exiting. Models an
+#                   animating TUI whose output never falls silent, so the
+#                   silence-gated Output::Idle completion arm can never fire and
+#                   the wait rides to the watchdog (the #81 hard-timeout repro).
 #
 # Dash-safe (CI shell is dash, see CLAUDE.md): multibyte glyphs are written
 # LITERALLY, never as \xHH byte escapes; no bashisms.
@@ -52,6 +58,25 @@ for w in $cmd; do
 	FCB_*_END) e=$w ;;
 	esac
 done
+
+if [ "$ANIMATE_FOREVER" = 1 ]; then
+	# Never-settling animating TUI: repaint a *changing* spinner glyph forever,
+	# faster than any poll interval, and never print the closing sentinel, never
+	# exit. Output::Idle can therefore never fire, the gate never opens, and there
+	# is no EOF — the only thing that can bound the wait is a wall-clock cap.
+	i=0
+	while :; do
+		case $(( i % 4 )) in
+		0) g='✻' ;;
+		1) g='✳' ;;
+		2) g='✽' ;;
+		*) g='✺' ;;
+		esac
+		printf '\r%s Thinking… (esc to interrupt) %d' "$g" "$i"
+		msleep 20
+		i=$(( i + 1 ))
+	done
+fi
 
 # "Think" slowly, repainting an animated spinner + interrupt hint the whole
 # time — a real TUI never falls silent on its own while working. Split the

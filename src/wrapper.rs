@@ -84,6 +84,19 @@ pub struct WrapperConfig {
     /// its own line in the transcript, or the gate's marker-less grace has
     /// elapsed. `None` (the default) disables the gate.
     pub idle_gate: Option<IdleGate>,
+    /// Absolute wall-clock ceiling for a single [`Self::wait_until_idle`] call
+    /// (the `--hard-timeout-ms` flag). Checked at the TOP of every loop iteration
+    /// BEFORE reading output and independent of the [`Output`] variant and of the
+    /// settle/idle-gate logic, so it bounds the wait even under continuous data
+    /// where `Output::Idle` never fires (an animating TUI, issue #81). On breach
+    /// the child is hard-terminated ([`PtySession::terminate`]) with no graceful
+    /// Ctrl+C and the wait returns [`Outcome::HardTimeout`].
+    ///
+    /// `None` (the library default) disables the cap — back-compat: `exec_timeout`
+    /// remains the only bound. The CLI defaults it to `exec_timeout` so the
+    /// intended `T_max` fires unconditionally, but a library caller opts in.
+    /// Applies per `wait_until_idle` call, exactly like `exec_timeout`.
+    pub hard_timeout: Option<Duration>,
     /// Bracketed-paste input (the `--paste-input` flag): wrap the whole command
     /// body in `ESC[200~`/`ESC[201~` and write it in one shot, then submit with a
     /// settled, separate `\r`. An editor in bracketed-paste mode (claude/codex
@@ -119,6 +132,7 @@ impl Default for WrapperConfig {
             burst_input: false,
             wrap_input: 0,
             idle_gate: None,
+            hard_timeout: None,
             paste_input: false,
             cols: DEFAULT_COLS,
         }
@@ -185,6 +199,20 @@ pub enum Outcome {
     TargetExitedEarly,
     /// The watchdog aborted the operation after `exec_timeout`.
     TimedOut,
+    /// The absolute wall-clock ceiling ([`WrapperConfig::hard_timeout`]) fired.
+    ///
+    /// Unlike [`Self::TimedOut`], this is not the graceful watchdog: the hard cap
+    /// is checked at the TOP of every loop iteration, BEFORE reading output and
+    /// regardless of the [`Output`] variant, so it bounds even a target that
+    /// streams continuously and never falls silent — an animating TUI whose
+    /// repaints keep resetting the activity clock, so `Output::Idle` never fires
+    /// and the graceful watchdog's Ctrl+C→grace escalation would otherwise still
+    /// have to run. On breach the child is hard-terminated immediately (no
+    /// graceful Ctrl+C) via [`PtySession::terminate`]. It is a *transient* — the
+    /// target simply never fenced (or settled) its reply within the ceiling — so
+    /// the caller maps it to a dedicated retry-able exit code, distinct from the
+    /// ambiguous non-retryable `TimedOut`. See #81.
+    HardTimeout,
 }
 
 /// Conservative size guardrail (in delivered bytes) above which the
@@ -592,7 +620,39 @@ impl Wrapper {
         self.markerless_quiet = None;
         self.state = State::Running;
 
-        loop {
+        // Per-arm loop-iteration counters and a watchdog-fired flag for the M1
+        // classification (all off unless FLAT_CYBORG_DIAG is set): they answer
+        // which arm actually bounds — or fails to bound — the wait. A
+        // never-settling animating TUI (issue #81) shows up as `idle=0` with the
+        // graceful watchdog firing: the `Output::Idle` completion arm is never
+        // reached, so only the watchdog (and, with M2, the hard cap) can end it.
+        let mut n_data: u64 = 0;
+        let mut n_idle: u64 = 0;
+        let mut n_eof: u64 = 0;
+        let mut watchdog_fired = false;
+
+        let outcome = loop {
+            // Absolute wall-clock ceiling: the last-resort wall. Checked FIRST,
+            // before the graceful watchdog and before reading output, and
+            // regardless of the `Output` variant or the settle/idle-gate state —
+            // so a target that streams continuously (an animating TUI whose
+            // repaints keep resetting the activity clock, #81) is bounded even
+            // though `Output::Idle` never fires. Unlike the watchdog there is no
+            // graceful Ctrl+C: this is the hard cap, so the child is terminated
+            // immediately. Reuses the SIGKILL-process-group + bounded-reap path.
+            if let Some(cap) = self.config.hard_timeout {
+                if start.elapsed() >= cap {
+                    crate::diag!(
+                        "wrapper.hardcap",
+                        "cap_ms={} elapsed_ms={} data={n_data} idle={n_idle}",
+                        cap.as_millis(),
+                        start.elapsed().as_millis()
+                    );
+                    self.session.terminate();
+                    break Outcome::HardTimeout;
+                }
+            }
+
             // Watchdog escalation.
             match interrupted_at {
                 Some(t) if t.elapsed() >= self.config.interrupt_grace => {
@@ -603,10 +663,11 @@ impl Wrapper {
                         start.elapsed().as_millis()
                     );
                     self.session.terminate();
-                    return Ok(Outcome::TimedOut);
+                    break Outcome::TimedOut;
                 }
                 None if start.elapsed() >= self.config.exec_timeout => {
                     // First escalation: send Ctrl+C and start the grace timer.
+                    watchdog_fired = true;
                     crate::diag!(
                         "wrapper.watchdog-interrupt",
                         "elapsed_ms={}",
@@ -620,6 +681,7 @@ impl Wrapper {
 
             match self.session.read_output(self.config.poll_interval) {
                 Output::Data(chunk) => {
+                    n_data += 1;
                     self.saw_output = true;
                     // The line sanitizer is always maintained (so `clean_log`
                     // works); the screen grid only in TUI mode.
@@ -705,10 +767,11 @@ impl Wrapper {
                             start.elapsed().as_millis()
                         );
                         self.state = State::Idle;
-                        return Ok(Outcome::Idle);
+                        break Outcome::Idle;
                     }
                 }
                 Output::Idle => {
+                    n_idle += 1;
                     // Silence long enough, and not mid-abort.
                     if interrupted_at.is_none()
                         && last_activity.elapsed() >= self.config.idle_silence
@@ -754,12 +817,13 @@ impl Wrapper {
                                     last_activity.elapsed().as_millis()
                                 );
                                 self.state = State::Idle;
-                                return Ok(Outcome::Idle);
+                                break Outcome::Idle;
                             }
                         }
                     }
                 }
                 Output::Eof => {
+                    n_eof += 1;
                     // The prime #71 suspect: the target's slave closed (it
                     // exited) mid-wait. `interrupted=false` means flat-cyborg did
                     // NOT abort it — the target vanished on its own and we are
@@ -776,7 +840,7 @@ impl Wrapper {
                     // Disconnected→Eof). A plain capture with no gate keeps
                     // `Completed`: with no sentinel contract, the exit IS the
                     // completion signal.
-                    let outcome = if interrupted_at.is_some() {
+                    let eof_outcome = if interrupted_at.is_some() {
                         Outcome::TimedOut
                     } else if self.config.idle_gate.is_some() && !self.idle_gate_open() {
                         Outcome::TargetExitedEarly
@@ -785,15 +849,26 @@ impl Wrapper {
                     };
                     crate::diag!(
                         "wrapper.eof",
-                        "outcome={outcome:?} interrupted={} gate_open={} elapsed_ms={}",
+                        "outcome={eof_outcome:?} interrupted={} gate_open={} elapsed_ms={}",
                         interrupted_at.is_some(),
                         self.idle_gate_open(),
                         start.elapsed().as_millis()
                     );
-                    return Ok(outcome);
+                    break eof_outcome;
                 }
             }
-        }
+        };
+
+        // Terminal M1 classification record (off unless FLAT_CYBORG_DIAG is set):
+        // one line per completed wait carrying which arm dominated. `idle=0`
+        // alongside a fired watchdog is the never-settling-TUI signature (#81).
+        crate::diag!(
+            "wrapper.loop-exit",
+            "outcome={outcome:?} data={n_data} idle={n_idle} eof={n_eof} \
+             watchdog_fired={watchdog_fired} elapsed_ms={}",
+            start.elapsed().as_millis()
+        );
+        Ok(outcome)
     }
 }
 
@@ -1044,6 +1119,69 @@ mod tests {
             w.screen_full_text().contains("FCB_T_END"),
             "the marker must be on the captured screen; screen: {:?}",
             w.screen_full_text()
+        );
+    }
+
+    #[test]
+    fn hard_cap_fires_under_continuous_animation() {
+        // A never-settling animating TUI: repaint a *changing* frame forever,
+        // faster than the poll interval, never emitting the closing marker and
+        // never exiting. `Output::Idle` can therefore never fire and the gate
+        // never opens — nothing bounds the wait but the hard cap. With a small
+        // `hard_timeout` well below `exec_timeout`, the wait must return
+        // `HardTimeout` at ~the cap, NOT ride to the watchdog.
+        let mut config = gated_config(None, Duration::from_secs(30));
+        config.hard_timeout = Some(Duration::from_secs(1));
+        let mut w = wrapper(
+            "sh",
+            &[
+                "-c",
+                "i=0; while :; do printf 'frame %d\\r' \"$i\"; i=$((i+1)); sleep 0.02; done",
+            ],
+            config,
+        );
+
+        let start = Instant::now();
+        let outcome = w.wait_until_idle().expect("wait");
+        let elapsed = start.elapsed();
+        assert_eq!(outcome, Outcome::HardTimeout);
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "the cap fired before its ceiling: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the cap did not fire at ~hard_timeout (rode to the watchdog?): {elapsed:?}"
+        );
+        // `terminate()` reaped the process group; dropping `w` is a no-op.
+    }
+
+    #[test]
+    fn hard_cap_never_clips_a_normal_reply() {
+        // A normal fenced reply completes on the closing marker long before the
+        // (generous) hard cap: the cap must never clip a legitimate reply.
+        let mut config = gated_config(None, Duration::from_secs(30));
+        config.hard_timeout = Some(Duration::from_secs(30));
+        let mut w = wrapper(
+            "sh",
+            &[
+                "-c",
+                "printf 'thinking\\n'; sleep 0.3; printf 'FCB_T_END\\n'; sleep 30",
+            ],
+            config,
+        );
+
+        let start = Instant::now();
+        let outcome = w.wait_until_idle().expect("wait");
+        let elapsed = start.elapsed();
+        assert_eq!(outcome, Outcome::Idle, "the cap clipped a normal reply");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "completed far below the cap, on the marker: {elapsed:?}"
+        );
+        assert!(
+            w.idle_gate_open(),
+            "must complete on its own closing marker"
         );
     }
 

@@ -96,14 +96,62 @@ fn capture_mode_propagates_target_exit_code() {
 
 #[test]
 fn watchdog_timeout_exits_124() {
-    // A target that never finishes; the watchdog interrupts it and the CLI
-    // reports the conventional timeout code.
+    // A target that never finishes; the graceful watchdog interrupts it and the
+    // CLI reports the conventional timeout code. The hard cap is raised above
+    // `--timeout-ms` so the graceful watchdog (not the hard cap, whose default
+    // equals `--timeout-ms`) is the arm exercised here.
+    let out = Command::new(bin())
+        .args([
+            "--timeout-ms",
+            "400",
+            "--hard-timeout-ms",
+            "30000",
+            "--",
+            "sh",
+            "-c",
+            "sleep 30",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(124), "expected timeout exit 124");
+}
+
+#[test]
+fn hard_timeout_default_exits_69() {
+    // The hard cap defaults to `--timeout-ms`, so a target that never finishes is
+    // bounded by the cap (immediate SIGKILL) at `--timeout-ms` and exits the
+    // reserved 69 — pre-empting the graceful watchdog's 124. This is the tight
+    // guaranteed bound that also fires under continuous data (issue #81).
     let out = Command::new(bin())
         .args(["--timeout-ms", "400", "--", "sh", "-c", "sleep 30"])
         .stdin(Stdio::null())
         .output()
         .expect("run");
-    assert_eq!(out.status.code(), Some(124), "expected timeout exit 124");
+    assert_eq!(
+        out.status.code(),
+        Some(69),
+        "expected the default hard cap to exit 69"
+    );
+}
+
+#[test]
+fn hard_timeout_ms_rejects_a_non_numeric_value() {
+    let out = Command::new(bin())
+        .args(["--hard-timeout-ms", "soon", "--", "true"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "bad flag value must be a usage error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid --hard-timeout-ms"),
+        "stderr: {stderr:?}"
+    );
 }
 
 #[test]
