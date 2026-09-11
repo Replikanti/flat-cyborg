@@ -44,7 +44,18 @@ OPTIONS:
                         large prompts: a multi-MB prompt as an argv value
                         overflows ARG_MAX (the Argument-list-too-long limit);
                         a file does not. Repeatable; selects orchestrator mode.
-    --timeout-ms <N>    Execution timeout per operation (default 60000).
+    --timeout-ms <N>    Execution timeout per operation (default 60000). The
+                        graceful watchdog: on expiry it sends Ctrl+C, waits a
+                        grace, then SIGKILLs (exit 124).
+    --hard-timeout-ms <N>
+                        Absolute wall-clock ceiling per operation (default: equal
+                        to --timeout-ms; $FLAT_CYBORG_HARD_TIMEOUT_MS when set).
+                        A last-resort wall checked regardless of output state, so
+                        it bounds even a continuously-animating TUI that never
+                        settles (where --timeout-ms's completion path can't fire).
+                        On breach the target is SIGKILLed immediately (no graceful
+                        Ctrl+C) and the run exits 69 (a retryable transient),
+                        distinct from the watchdog's 124.
     --idle-ms <N>       Silence after the prompt before declaring IDLE
                         (default 500).
     --prompt <TOKEN>    Trailing prompt token for IDLE detection (repeatable;
@@ -217,6 +228,17 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
     if let Ok(v) = std::env::var("FLAT_CYBORG_COLS") {
         config.cols = parse_cols(&v).map_err(|_| format!("invalid $FLAT_CYBORG_COLS: {v}"))?;
     }
+    // The absolute wall-clock ceiling (`--hard-timeout-ms`). `$FLAT_CYBORG_HARD_TIMEOUT_MS`
+    // is the default for drivers that cannot pass flags; an explicit flag wins
+    // (mirrors `--cols`). Resolved after the loop to `exec_timeout` when unset,
+    // so the intended `T_max` fires unconditionally.
+    let mut hard_timeout: Option<Duration> = None;
+    if let Ok(v) = std::env::var("FLAT_CYBORG_HARD_TIMEOUT_MS") {
+        let ms: u64 = v
+            .parse()
+            .map_err(|_| format!("invalid $FLAT_CYBORG_HARD_TIMEOUT_MS: {v}"))?;
+        hard_timeout = Some(Duration::from_millis(ms));
+    }
     let mut prompts: Vec<String> = Vec::new();
     let mut extract = false;
     let mut extract_structural = false;
@@ -263,6 +285,13 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
                     .parse()
                     .map_err(|_| format!("invalid --timeout-ms: {v}"))?;
                 config.exec_timeout = Duration::from_millis(ms);
+            }
+            "--hard-timeout-ms" => {
+                let v = take_value("--hard-timeout-ms")?;
+                let ms: u64 = v
+                    .parse()
+                    .map_err(|_| format!("invalid --hard-timeout-ms: {v}"))?;
+                hard_timeout = Some(Duration::from_millis(ms));
             }
             "--idle-ms" => {
                 let v = take_value("--idle-ms")?;
@@ -325,6 +354,13 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
     if !prompts.is_empty() {
         config.prompt_tokens = prompts;
     }
+
+    // The hard cap defaults to `exec_timeout`: the SAME intended bound as the
+    // graceful watchdog, but enforced UNCONDITIONALLY at the top of every wait
+    // iteration so it fires even under continuous data (an animating TUI where
+    // the watchdog's completion path never triggers, #81). Resolved here, after
+    // parsing, so it tracks a `--timeout-ms` given in any argv position.
+    config.hard_timeout = Some(hard_timeout.unwrap_or(config.exec_timeout));
 
     // Validate `--cwd` here (a usage error → exit 2), before spawning.
     if let Some(dir) = &cwd {
@@ -576,9 +612,13 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
         };
         sentinels_used = pair;
         last = wrapper.run_command(&effective)?;
-        // A watchdog timeout or a mid-reply target death ends the session: the
-        // target is gone (or unresponsive), so later `--cmd` commands cannot run.
-        if matches!(last, Outcome::TimedOut | Outcome::TargetExitedEarly) {
+        // A watchdog timeout, a hard-cap breach, or a mid-reply target death ends
+        // the session: the target is gone (or unresponsive), so later `--cmd`
+        // commands cannot run.
+        if matches!(
+            last,
+            Outcome::TimedOut | Outcome::HardTimeout | Outcome::TargetExitedEarly
+        ) {
             break;
         }
     }
@@ -620,6 +660,16 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
         eprintln!(
             "flat-cyborg: the target exited before completing its reply \
              (mid-reply exit; treated as transient, exit {EX_TEMPFAIL})"
+        );
+    }
+    // Observability only (the machine contract is exit 69): the target streamed
+    // continuously and never fenced (or settled) its reply within the absolute
+    // ceiling, so the hard cap SIGKILLed it. Mirrors the mid-reply-death line so
+    // a bare non-zero exit is not read as a real fault.
+    if last == Outcome::HardTimeout {
+        eprintln!(
+            "flat-cyborg: the target streamed continuously and was hard-capped \
+             at --hard-timeout-ms; treated as transient, exit {EX_UNAVAILABLE}"
         );
     }
     Ok(exit_code_for(&mut wrapper, last, reply_recovered))
@@ -799,15 +849,31 @@ fn reply_from_transcript(
 /// be reported as a lost reply. See issue #71.
 const EX_TEMPFAIL: u8 = 75;
 
+/// Reserved exit code for the hard wall-clock cap ([`WrapperConfig::hard_timeout`],
+/// `--hard-timeout-ms`): the target streamed continuously and never fenced (or
+/// settled) its reply within the absolute ceiling, so the cap fired and the child
+/// was SIGKILLed. `69` is `EX_UNAVAILABLE` from `sysexits.h` — used here as a
+/// distinct, retry-able transient signal so a resilience layer can key on it by
+/// contract instead of scraping stderr. It is deliberately separate from the
+/// graceful watchdog's `124` (ambiguous, non-retryable) and from `75`
+/// ([`EX_TEMPFAIL`], the mid-reply target death), and collides with none of
+/// `0`/`1`/`2`/`124`/`137`. See issue #81.
+const EX_UNAVAILABLE: u8 = 69;
+
 /// Maps a terminal [`Outcome`] to a process exit code: the target's own exit
-/// status when it completed, `124` on watchdog timeout, `75` when the target
-/// vanished mid-reply AND the reply was lost (transient; see [`EX_TEMPFAIL`]),
-/// `0` when it returned to an idle prompt OR the mid-reply-death reply was still
-/// recovered (`reply_recovered`). `reply_recovered` reflects whether
-/// [`print_capture`] actually put a reply on stdout.
+/// status when it completed, `124` on graceful-watchdog timeout, `69` when the
+/// absolute hard cap fired (transient; see [`EX_UNAVAILABLE`]), `75` when the
+/// target vanished mid-reply AND the reply was lost (transient; see
+/// [`EX_TEMPFAIL`]), `0` when it returned to an idle prompt OR the
+/// mid-reply-death reply was still recovered (`reply_recovered`).
+/// `reply_recovered` reflects whether [`print_capture`] actually put a reply on
+/// stdout.
 fn exit_code_for(wrapper: &mut Wrapper, outcome: Outcome, reply_recovered: bool) -> ExitCode {
     match outcome {
         Outcome::TimedOut => ExitCode::from(124),
+        // The absolute wall-clock cap fired: a retryable transient, distinct from
+        // the graceful watchdog's ambiguous 124 (see [`EX_UNAVAILABLE`]).
+        Outcome::HardTimeout => ExitCode::from(EX_UNAVAILABLE),
         // The target vanished mid-reply. Signal the retryable transient ONLY when
         // the reply was genuinely lost; if the structural fallback still recovered
         // and printed it, the answer reached the caller — that is a success, and
