@@ -280,8 +280,11 @@ flat-cyborg --extract --extract-structural --result-file "$RUN/reply.txt" \
   `/tmp`, so a host temp path is invisible inside it: pass a path under a
   directory the sandbox binds read-write at the identical host path (e.g. the run
   directory), and both the model (inside) and flat-cyborg (on the host) see the
-  same file. `$FLAT_CYBORG_RESULT_FILE_PATH` supplies the default for drivers
-  with a fixed argv builder; an explicit `--result-file` wins.
+  same file. flat-cyborg clears the path at the start of every turn, so a
+  reused fixed path is safe: a turn that writes nothing leaves no file and
+  correctly falls through (no stale prior-turn reply is read as this answer).
+  `$FLAT_CYBORG_RESULT_FILE_PATH` supplies the default for drivers with a
+  fixed argv builder; an explicit `--result-file` wins.
 - **Pair it with `--extract-structural`** so a marker-less run still completes on
   a settled screen (bounded) instead of riding the full `--timeout-ms`.
 

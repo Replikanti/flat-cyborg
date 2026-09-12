@@ -26,8 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-file outcome keeps its exit code). An empty or unwritten `PATH` logs one
   stderr line naming the no-op and falls back to transcript/screen extraction,
   byte-identical to a run without the flag. The caller owns the path (flat-cyborg
-  only reads it) and must place it where the target can write — e.g. under a
-  directory a sandbox binds read-write at the same host path.
+  only reads it), clears it at the start of every turn (so a reused fixed path
+  is safe — no stale prior-turn reply can be read as the current answer), and
+  must place it where the target can write — e.g. under a directory a sandbox
+  binds read-write at the same host path.
   `$FLAT_CYBORG_RESULT_FILE_PATH` is the default for drivers with a fixed argv
   builder (distinct from a consuming repo's boolean `FLAT_CYBORG_RESULT_FILE`
   gate); an explicit flag wins. (#79)

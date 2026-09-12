@@ -666,6 +666,19 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
             Some((begin, end)) => wrap_command(cmd, begin, end, result_file.as_deref()),
             None => cmd.clone(),
         };
+        // Freshness guard: clear the result file at ARM time — before this turn's
+        // prompt is sent — so the post-turn read in `print_capture` can only ever
+        // see THIS turn's write. A reused fixed path (exactly what
+        // `$FLAT_CYBORG_RESULT_FILE_PATH` as a fixed-argv default invites) would
+        // otherwise let a stale prior-turn reply be read as the current answer AND
+        // arm the exit-0 override, masking a genuine failure. Removal (not just
+        // truncation) means a turn that writes nothing leaves NO file → step 0
+        // falls through to the screen and the real timeout/mid-reply exit surfaces.
+        // Bulletproof, with no clock/mtime dependency. Best-effort: a path the
+        // target can write is one flat-cyborg (its host-side parent) can remove.
+        if let Some(rf) = result_file.as_deref() {
+            std::fs::remove_file(rf).ok();
+        }
         sentinels_used = pair;
         last = wrapper.run_command(&effective)?;
         // A watchdog timeout, a hard-cap breach, or a mid-reply target death ends
@@ -742,6 +755,14 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
 fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     let tui = args.config.tui;
     let program = args.program.clone();
+    // Capture mode (no --cmd) never sends the wrap directive, so --result-file has
+    // nothing to arm — say so rather than silently ignoring the flag.
+    if args.result_file.is_some() {
+        eprintln!(
+            "flat-cyborg: --result-file has no effect without --cmd \
+             (capture mode does not send the reply-to-file directive)"
+        );
+    }
     // --extract has nothing to wrap here (no --cmd selects orchestrator mode),
     // so there are no sentinel markers in the output; extraction therefore warns
     // and prints nothing (strict default), or — with --extract-structural — tries

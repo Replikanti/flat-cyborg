@@ -634,3 +634,67 @@ fn result_file_without_extract_is_a_usage_error() {
         "stderr: {stderr:?}"
     );
 }
+
+#[test]
+fn result_file_stale_content_on_a_reused_path_is_not_read_as_the_new_reply() {
+    // Regression (PR #84 review): a driver reuses ONE fixed --result-file path
+    // across turns (what $FLAT_CYBORG_RESULT_FILE_PATH invites). Turn 1 writes a
+    // reply and fences it (completes, exit 0, file now holds ANSWER_ONE). Turn 2
+    // asks a different question, writes NOTHING, and hangs → a real timeout. The
+    // arm-time truncation must clear the stale ANSWER_ONE before turn 2, so
+    // flat-cyborg must NOT print turn 1's content and must NOT exit 0: the read
+    // falls through to the screen (no fence there) and the watchdog timeout (124)
+    // surfaces. Without the guard this printed ANSWER_ONE and exited 0.
+    let path = result_file_path("stale-reuse");
+    let script = format!(
+        "n=1; printf 'BANNER\\n'; while read l; do \
+         b=; e=; for w in $l; do \
+         case $w in FCB_*_BEGIN) b=$w ;; FCB_*_END) e=$w ;; esac; done; \
+         if [ \"$n\" = 1 ]; then printf 'ANSWER_ONE\\n' > '{}'; \
+         printf '%s\\nDONE_ONE\\n%s\\n' \"$b\" \"$e\"; \
+         else sleep 30; fi; n=$((n+1)); done",
+        path.display()
+    );
+    let out = Command::new(bin())
+        .args([
+            "--extract",
+            "--no-jitter",
+            "--idle-ms",
+            "300",
+            "--timeout-ms",
+            "800",
+            "--hard-timeout-ms",
+            "30000",
+            "--result-file",
+            &path.to_string_lossy(),
+            "--cmd",
+            "q1",
+            "--cmd",
+            "q2",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run two turns on one reused --result-file path");
+    std::fs::remove_file(&path).ok();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("ANSWER_ONE"),
+        "turn 1's stale reply must not be read as turn 2's answer: {stdout:?}"
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a stale file must not arm the exit-0 override on a genuine timeout; \
+         stdout: {stdout:?}, stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "the real watchdog timeout must surface once the stale file is cleared"
+    );
+}
