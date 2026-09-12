@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.17.0] - 2026-09-13
 
 ### Added
 
@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `$FLAT_CYBORG_RESULT_FILE_PATH` is the default for drivers with a fixed argv
   builder (distinct from a consuming repo's boolean `FLAT_CYBORG_RESULT_FILE`
   gate); an explicit flag wins. (#79)
+
+## [Unreleased]
 
 ## [0.16.1] — 2026-09-12
 
@@ -229,6 +231,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `codex --extract`: single-line `wrap_command` + line-end fence integrity (#40).
 - `--paste-input`: bracketed-paste input delivery, opt-in (#49).
 
+[Unreleased]: https://github.com/Replikanti/flat-cyborg/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.16.1...v0.17.0
+[0.16.1]: https://github.com/Replikanti/flat-cyborg/compare/v0.16.0...v0.16.1
+[0.16.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.13.0...v0.14.0
 [0.12.1]: https://github.com/Replikanti/flat-cyborg/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.11.0...v0.12.0
@@ -236,6 +243,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.10.2]: https://github.com/Replikanti/flat-cyborg/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/Replikanti/flat-cyborg/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Replikanti/flat-cyborg/releases/tag/v0.10.0
-[0.16.1]: https://github.com/Replikanti/flat-cyborg/compare/v0.16.0...v0.16.1
-[0.16.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.15.0...v0.16.0
-[0.15.0]: https://github.com/Replikanti/flat-cyborg/compare/v0.14.0...v0.15.0
