@@ -90,6 +90,7 @@ flat-cyborg picks a mode automatically:
 | `--extract-grace-ms <MS>` | How long the output must be **continuously quiet** before a reply *without* the closing marker is accepted as finished. With `--extract-structural` the default is `min(max(4 × --idle-ms, 30000), --timeout-ms / 2)` — a 30 s floor, scaled up for a driver that already expects long silences, and kept well inside the watchdog budget. Whatever the value, a settled screen is accepted at the latest in the final `--idle-ms` before `--timeout-ms`, so waiting for the marker never costs a `124`. `0` completes on the first settled screen (the pre-0.13.0 `--extract-structural` behavior); strict `--extract` has no grace unless this flag sets one. |
 | `--transcript-dir <DIR>` | Directory of the target's own reply transcripts (default `$HOME/.claude/projects`). Under `--extract` with a claude target, the sentinel-fenced reply is recovered from the transcript **first** — it is authoritative and independent of how the TUI renders the reply, so a reply too long to fit (or collapsed off) the rendered screen is still captured whole; the screen scrape stays the fallback. Recovery keys on the run's unique sentinel (immune to path sanitization and concurrent sessions) and no-ops when the target is not claude, transcript saving is off, or no fence is present. |
 | `--no-transcript-read` | Disable transcript recovery; extract from the rendered screen only (the pre-transcript behavior). |
+| `--result-file <PATH>` | Ask the target to **also** write its complete reply to `PATH` with its own file-writing tool, and read the reply from `PATH` **first** — preferred over the transcript and the screen (**file > transcript > screen**). A file the model writes is exact bytes, immune to reply size, TUI line-wrap, and a dark transcript (a driven *interactive* claude persists no `.jsonl`, so the transcript leg is empty on that path). Requires `--extract` (the directive rides its sentinel wrap). Defaults to `$FLAT_CYBORG_RESULT_FILE_PATH` when set (an explicit flag wins) — note this is the PATH env, distinct from a consuming repo's own boolean `FLAT_CYBORG_RESULT_FILE` gate. On a **non-empty** `PATH` the run exits `0` even on a timeout / mid-reply exit (the answer already reached the caller); an empty or unwritten `PATH` logs one stderr line and falls back to transcript/screen extraction, **byte-identical** to a run without the flag. The caller must pass a path the target can write (e.g. under a directory the sandbox binds read-write at the same host path); flat-cyborg only reads it. Pair it with `--extract-structural` so the run completes on a settled screen rather than riding `--timeout-ms` when the model omits the sentinel. |
 | `--tui` | Full-screen TUI mode (see below). |
 | `--no-jitter` | Write each `--cmd` as a fast chunked burst instead of one human-cadenced keystroke at a time (40-300 ms each — minutes for a multi-thousand-char prompt). Use for programmatic LLM drivers where the anti-anomaly typing cadence is not wanted. Best-effort for large prompts only: as a precaution it errors out above a conservative size guardrail (a policy line, not a proven boundary; measured *after* `--wrap-input` folding) and directs you to `--paste-input`, which delivers large prompts deterministically. |
 | `--wrap-input <COLS>` | Soft-fold each input line to at most `COLS` columns at word boundaries before sending (default `0` = off). An ultra-long *single* line overflows an Ink-style editor's input field so the prompt is never delivered whole; folding it (the model reads the wrapped text identically) makes a large prompt land reliably. Pairs with `--no-jitter` — but for large prompts prefer `--paste-input`, which needs no folding and is not size-capped. (Folding inserts line breaks, so it *grows* the byte count the `--no-jitter` size guardrail measures.) |
@@ -250,6 +251,40 @@ closes, and flat-cyborg distinguishes them by exit code:
 - **Watchdog abort → exit `124`.** flat-cyborg itself interrupted the target
   after `--timeout-ms` (the marker never appeared and the screen never settled).
 
+### Capturing the reply as a file (`--result-file`)
+
+The screen scrape and the transcript both depend on the target's UI: a long
+reply can be re-wrapped or collapsed off the rendered screen, and a driven
+*interactive* claude (subscription, not `claude -p`) persists **no** `.jsonl`,
+so the transcript leg is empty on that path. `--result-file <PATH>` sidesteps
+both by asking the model to write its complete reply to a file with its own
+file-writing tool — exact bytes, independent of how the UI renders them:
+
+```console
+flat-cyborg --extract --extract-structural --result-file "$RUN/reply.txt" \
+    --idle-ms 12000 --timeout-ms 240000 \
+    --cmd "$prompt" -- claude
+```
+
+- **Precedence is file > transcript > screen.** The file is read first; the
+  transcript and the screen scrape stay as fallbacks, so the mode is strictly
+  additive.
+- **Fallback is byte-identical.** If the file is empty, missing, or unreadable
+  (a weak model or a tool refusal), flat-cyborg logs one stderr line naming the
+  no-op and falls through to today's transcript→screen extraction unchanged.
+- **A non-empty file exits `0`** even if the run would otherwise time out or the
+  target died mid-reply — the answer already reached the caller. This override is
+  scoped strictly to the file-hit path; every non-file outcome keeps its code.
+- **The caller owns the path.** flat-cyborg never creates it and only reads it,
+  so it must be somewhere the target can write. A sandboxed target gets a fresh
+  `/tmp`, so a host temp path is invisible inside it: pass a path under a
+  directory the sandbox binds read-write at the identical host path (e.g. the run
+  directory), and both the model (inside) and flat-cyborg (on the host) see the
+  same file. `$FLAT_CYBORG_RESULT_FILE_PATH` supplies the default for drivers
+  with a fixed argv builder; an explicit `--result-file` wins.
+- **Pair it with `--extract-structural`** so a marker-less run still completes on
+  a settled screen (bounded) instead of riding the full `--timeout-ms`.
+
 ### Large prompts
 
 Three limits bite when the prompt gets big, each with its own flag:
@@ -316,7 +351,7 @@ does not, or when you specifically need the interactive path.
 
 | Code | Meaning |
 |------|---------|
-| `0` | Success — target exited 0, or returned to an idle prompt. |
+| `0` | Success — target exited 0, or returned to an idle prompt. Also returned when `--result-file` holds a non-empty reply, even if the outcome would otherwise be `69`/`75`/`124`: the answer reached the caller via the file (the exit-0-on-file-hit override, scoped strictly to the file-hit path). |
 | target's code | In capture/orchestrator mode, the target's own exit status is propagated. |
 | `1` | Generic failure — flat-cyborg itself failed (e.g. the target could not be spawned), or the target was killed by a signal. |
 | `2` | Usage error (bad arguments). |

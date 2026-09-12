@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--result-file <PATH>` / `$FLAT_CYBORG_RESULT_FILE_PATH` — capture the reply
+  as a file.** The screen scrape and the transcript both depend on the target's
+  UI: a long reply can be re-wrapped or collapsed off the rendered screen, and a
+  driven *interactive* claude (subscription, not `claude -p`) persists no
+  `.jsonl`, so the transcript leg is empty on that path. `--result-file` appends
+  one single-line clause to the `--extract` sentinel wrap asking the model to
+  also write its complete reply to `PATH` with its own file-writing tool, then
+  reads the reply from `PATH` **first** — preferred over the transcript and the
+  screen (**file > transcript > screen**). A file the model writes is exact
+  bytes, immune to reply size, TUI line-wrap, and a dark transcript, and keeps
+  the target on its interactive/TTY code path (no `claude -p`). Requires
+  `--extract` (the directive rides the wrap; without it, a usage error). On a
+  non-empty `PATH` the run exits `0` even on a `69`/`75`/`124` outcome — the
+  answer already reached the caller (scoped strictly to the file-hit path; every
+  non-file outcome keeps its exit code). An empty or unwritten `PATH` logs one
+  stderr line naming the no-op and falls back to transcript/screen extraction,
+  byte-identical to a run without the flag. The caller owns the path (flat-cyborg
+  only reads it) and must place it where the target can write — e.g. under a
+  directory a sandbox binds read-write at the same host path.
+  `$FLAT_CYBORG_RESULT_FILE_PATH` is the default for drivers with a fixed argv
+  builder (distinct from a consuming repo's boolean `FLAT_CYBORG_RESULT_FILE`
+  gate); an explicit flag wins. (#79)
+
 ## [0.16.1] — 2026-09-12
 
 ### Added
