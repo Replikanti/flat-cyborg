@@ -113,6 +113,22 @@ OPTIONS:
     --no-transcript-read
                         Disable transcript recovery; extract from the rendered
                         screen only (the pre-transcript behavior).
+    --result-file <PATH>
+                        Ask the target to ALSO write its complete reply to PATH
+                        with its own file-writing tool, then read the reply from
+                        PATH FIRST — preferred over the transcript and the screen
+                        (file > transcript > screen). A file the model writes is
+                        exact bytes: immune to reply size, TUI line-wrap, and a
+                        dark transcript. Requires --extract (the directive rides
+                        its sentinel wrap). Defaults to
+                        $FLAT_CYBORG_RESULT_FILE_PATH when set; an explicit flag
+                        wins. On a non-empty PATH the run exits 0 even on a
+                        timeout / mid-reply exit (the answer already reached the
+                        caller); an empty or unwritten PATH logs one line and
+                        falls back to transcript/screen extraction, byte-identical
+                        to a run without the flag. The caller must pass a path the
+                        target can write (e.g. under a sandbox-shared directory);
+                        flat-cyborg only reads it.
     --no-jitter         Write each --cmd as a single burst with no per-keystroke
                         human-cadence delay. The default jitter types one char
                         at a time (40-300 ms each), which is minutes for a
@@ -158,6 +174,15 @@ struct Args {
     /// a fallback. `None` = disabled (`--no-transcript-read`, or a non-claude /
     /// no-`--extract` run). Defaults to `$HOME/.claude/projects`.
     transcript_dir: Option<String>,
+    /// `--result-file <PATH>` / `$FLAT_CYBORG_RESULT_FILE_PATH`: a caller-owned
+    /// path the target is asked to write its complete reply to (via its own
+    /// file-writing tool, appended to the `--extract` sentinel wrap). Read FIRST
+    /// in [`print_capture`] (file > transcript > screen) because a file the model
+    /// writes is exact bytes — immune to reply size, TUI line-wrap, and a dark
+    /// transcript. `None` = the channel is off (unchanged behavior). Deliberately
+    /// NOT `$FLAT_CYBORG_RESULT_FILE` (a consuming repo uses that name as an
+    /// on/off boolean gate — this is the PATH, a distinct env key).
+    result_file: Option<String>,
     cwd: Option<String>,
     program: String,
     program_args: Vec<String>,
@@ -239,6 +264,13 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
             .map_err(|_| format!("invalid $FLAT_CYBORG_HARD_TIMEOUT_MS: {v}"))?;
         hard_timeout = Some(Duration::from_millis(ms));
     }
+    // `$FLAT_CYBORG_RESULT_FILE_PATH` is the result-file default for drivers that
+    // cannot pass flags; an explicit `--result-file` still wins below. An empty
+    // value counts as unset. (Distinct from a consuming repo's boolean
+    // `FLAT_CYBORG_RESULT_FILE` gate — this is the PATH.)
+    let mut result_file: Option<String> = std::env::var("FLAT_CYBORG_RESULT_FILE_PATH")
+        .ok()
+        .filter(|v| !v.is_empty());
     let mut prompts: Vec<String> = Vec::new();
     let mut extract = false;
     let mut extract_structural = false;
@@ -337,6 +369,10 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
             "--transcript-dir" => transcript_dir = Some(take_value("--transcript-dir")?),
             // Opt OUT of transcript recovery; fall back to screen scraping only.
             "--no-transcript-read" => transcript_off = true,
+            // A caller-owned path the target is asked to write its reply to; read
+            // first in `print_capture` (see Args::result_file). An explicit flag
+            // overrides the `$FLAT_CYBORG_RESULT_FILE_PATH` default.
+            "--result-file" => result_file = Some(take_value("--result-file")?),
             "--no-jitter" => config.burst_input = true,
             "--paste-input" => config.paste_input = true,
             "--wrap-input" => {
@@ -369,6 +405,13 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
         }
     }
 
+    // The result-file directive rides the `--extract` sentinel wrap, so it is
+    // meaningless without it: reject the combination as a usage error rather than
+    // silently arming a channel the target is never told to write.
+    if result_file.is_some() && !extract {
+        return Err("--result-file requires --extract".into());
+    }
+
     // Resolve the transcript directory: an explicit --transcript-dir wins; else,
     // for an --extract run (transcript recovery is a reply-extraction aid),
     // default to `$HOME/.claude/projects`. --no-transcript-read forces it off.
@@ -397,6 +440,7 @@ fn parse_from(raw: Vec<String>) -> Result<Mode, String> {
         extract_structural,
         extract_grace,
         transcript_dir,
+        result_file,
         cwd,
         program: rest[0].clone(),
         program_args: rest[1..].to_vec(),
@@ -499,12 +543,23 @@ fn default_markerless_grace(idle: Duration, exec_timeout: Duration) -> Duration 
 /// echoed-instruction markers remain. One line → both arrive as one submission.
 /// (Claude treats an embedded newline as a soft break, so it was unaffected
 /// either way; this makes codex work too.)
-fn wrap_command(cmd: &str, begin: &str, end: &str) -> String {
-    format!(
+fn wrap_command(cmd: &str, begin: &str, end: &str, result_file: Option<&str>) -> String {
+    let base = format!(
         "{cmd}    IMPORTANT: Output ONLY your answer, wrapped exactly between \
          the marker {begin} on its own line before it and the marker {end} on \
          its own line after it. Do not include the markers anywhere else."
-    )
+    );
+    // When `--result-file` is armed, append ONE additional single-line clause
+    // (still no embedded `\n`, for the codex newline-submit constraint above):
+    // the model writes its exact reply to the caller-owned path, read first in
+    // `print_capture`. The sentinel wrap stays — the screen path is the fallback.
+    match result_file {
+        Some(path) => format!(
+            "{base} Also write your COMPLETE reply (only the reply, nothing else) \
+             to the file {path} using your file-writing tool."
+        ),
+        None => base,
+    }
 }
 
 fn main() -> ExitCode {
@@ -574,6 +629,7 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
     let exec_timeout = args.config.exec_timeout;
     let extract_structural = args.extract_structural;
     let transcript_dir = args.transcript_dir.clone();
+    let result_file = args.result_file.clone();
     // Recovery only considers transcript files touched from here on, so a stale
     // session that happens to reuse a sentinel token can never be picked up.
     let since = std::time::SystemTime::now();
@@ -607,9 +663,22 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
         // Wrapping (when used) is kept a CLI concern; the wrapper library stays
         // unaware of sentinels.
         let effective = match &pair {
-            Some((begin, end)) => wrap_command(cmd, begin, end),
+            Some((begin, end)) => wrap_command(cmd, begin, end, result_file.as_deref()),
             None => cmd.clone(),
         };
+        // Freshness guard: clear the result file at ARM time — before this turn's
+        // prompt is sent — so the post-turn read in `print_capture` can only ever
+        // see THIS turn's write. A reused fixed path (exactly what
+        // `$FLAT_CYBORG_RESULT_FILE_PATH` as a fixed-argv default invites) would
+        // otherwise let a stale prior-turn reply be read as the current answer AND
+        // arm the exit-0 override, masking a genuine failure. Removal (not just
+        // truncation) means a turn that writes nothing leaves NO file → step 0
+        // falls through to the screen and the real timeout/mid-reply exit surfaces.
+        // Bulletproof, with no clock/mtime dependency. Best-effort: a path the
+        // target can write is one flat-cyborg (its host-side parent) can remove.
+        if let Some(rf) = result_file.as_deref() {
+            std::fs::remove_file(rf).ok();
+        }
         sentinels_used = pair;
         last = wrapper.run_command(&effective)?;
         // A watchdog timeout, a hard-cap breach, or a mid-reply target death ends
@@ -642,15 +711,17 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
     // one actually reached stdout decides if this was a lost reply (exit 75) or a
     // mere missing marker (exit 0) — so it must be known before both the
     // observability line and the exit-code mapping below.
-    let reply_recovered = print_capture(
+    let captured = print_capture(
         &wrapper,
         tui,
         sentinels_used.as_ref(),
         &program,
         extract_structural,
         transcript_dir.as_deref(),
+        result_file.as_deref(),
         since,
     );
+    let reply_recovered = captured.reply_recovered;
     // Observability only (NOT the machine contract — that is exit 75): tell the
     // operator the target vanished mid-reply and its reply was LOST, so a bare
     // non-zero exit is not read as a real fault. Suppressed when the reply was
@@ -672,20 +743,33 @@ fn orchestrate(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode>
              at --hard-timeout-ms; treated as transient, exit {EX_UNAVAILABLE}"
         );
     }
-    Ok(exit_code_for(&mut wrapper, last, reply_recovered))
+    Ok(exit_code_for(
+        &mut wrapper,
+        last,
+        reply_recovered,
+        captured.from_result_file,
+    ))
 }
 
 /// Capture mode: run the target to completion, print its sanitized output.
 fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
     let tui = args.config.tui;
     let program = args.program.clone();
+    // Capture mode (no --cmd) never sends the wrap directive, so --result-file has
+    // nothing to arm — say so rather than silently ignoring the flag.
+    if args.result_file.is_some() {
+        eprintln!(
+            "flat-cyborg: --result-file has no effect without --cmd \
+             (capture mode does not send the reply-to-file directive)"
+        );
+    }
     // --extract has nothing to wrap here (no --cmd selects orchestrator mode),
     // so there are no sentinel markers in the output; extraction therefore warns
     // and prints nothing (strict default), or — with --extract-structural — tries
     // a chrome-filtered structural scrape for a known CLI.
     let mut wrapper = Wrapper::with_config(session, args.config);
     let outcome = wrapper.wait_until_idle()?;
-    let reply_recovered = print_capture(
+    let captured = print_capture(
         &wrapper,
         tui,
         args.extract.then(|| sentinels(0)).as_ref(),
@@ -694,9 +778,16 @@ fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
         // Capture mode never wraps/sends a sentinel command, so there is no
         // fenced reply to recover from a transcript — screen path only.
         None,
+        // ... and it never sends the result-file directive either.
+        None,
         std::time::SystemTime::now(),
     );
-    Ok(exit_code_for(&mut wrapper, outcome, reply_recovered))
+    Ok(exit_code_for(
+        &mut wrapper,
+        outcome,
+        captured.reply_recovered,
+        captured.from_result_file,
+    ))
 }
 
 /// Prints the captured output: the rendered screen in TUI mode, otherwise the
@@ -710,11 +801,24 @@ fn capture(session: PtySession, args: Args) -> flat_cyborg::Result<ExitCode> {
 ///
 /// The full transcript (including lines scrolled off the top in TUI mode) is
 /// used for extraction so long multi-line replies are captured whole.
-/// Returns `true` when an actual reply reached stdout (a fenced or clean
-/// structural reply under `--extract`, or the plain captured output without it),
-/// `false` when `--extract` found nothing printable. The caller uses this to
+/// `reply_recovered` is `true` when an actual reply reached stdout (a fenced or
+/// clean structural reply under `--extract`, or the plain captured output without
+/// it), `false` when `--extract` found nothing printable. The caller uses it to
 /// decide whether a mid-reply target death actually lost the reply (exit 75) or
 /// merely dropped the closing marker while the reply was still recovered (exit 0).
+/// `from_result_file` is `true` when the printed reply came from the
+/// `--result-file` channel: an authoritative source that arms the exit-0-on-hit
+/// override (the answer already reached the caller, so the run succeeded even if
+/// the completion path never fired).
+struct CaptureResult {
+    reply_recovered: bool,
+    from_result_file: bool,
+}
+
+// Extraction threads one context arg per source (screen/transcript/result-file)
+// plus the run metadata; grouping them into a struct would only rename the same
+// fan-in. The legs are independent and the call sites are the two capture modes.
+#[allow(clippy::too_many_arguments)]
 fn print_capture(
     wrapper: &Wrapper,
     tui: bool,
@@ -722,8 +826,39 @@ fn print_capture(
     program: &str,
     allow_structural: bool,
     transcript_dir: Option<&str>,
+    result_file: Option<&str>,
     since: std::time::SystemTime,
-) -> bool {
+) -> CaptureResult {
+    // Step 0: the caller-provided result file is the MOST authoritative source —
+    // the target wrote its complete reply there with its own file tool, exact
+    // bytes, immune to reply size, TUI line-wrap, and a dark transcript. Preferred
+    // over the transcript and the screen (file > transcript > screen). An empty,
+    // missing, or unreadable file means the target no-oped the directive: say so
+    // in ONE loud stderr line and fall through, byte-identically to a run without
+    // `--result-file`. (#79)
+    if let Some(rf) = result_file {
+        match std::fs::read_to_string(rf) {
+            Ok(body) if !body.trim().is_empty() => {
+                // Print the exact bytes; guarantee the single trailing newline a
+                // reply on stdout carries, without doubling one the model wrote.
+                print!("{body}");
+                if !body.ends_with('\n') {
+                    println!();
+                }
+                io::stdout().flush().ok();
+                return CaptureResult {
+                    reply_recovered: true,
+                    from_result_file: true,
+                };
+            }
+            _ => {
+                eprintln!(
+                    "flat-cyborg: --result-file {rf} empty or unwritten by the \
+                     target; falling back to transcript/screen extraction"
+                );
+            }
+        }
+    }
     if let Some((begin, end)) = sentinels {
         // Authoritative source FIRST: the target's own reply transcript captures
         // the whole reply regardless of how its TUI renders long output — newer
@@ -735,7 +870,10 @@ fn print_capture(
             if let Some(reply) = reply_from_transcript(dir, program, begin, end, since) {
                 println!("{reply}");
                 io::stdout().flush().ok();
-                return true;
+                return CaptureResult {
+                    reply_recovered: true,
+                    from_result_file: false,
+                };
             }
         }
         let text = if tui {
@@ -768,7 +906,10 @@ fn print_capture(
             }
         };
         io::stdout().flush().ok();
-        return recovered;
+        return CaptureResult {
+            reply_recovered: recovered,
+            from_result_file: false,
+        };
     }
     if tui {
         println!("{}", wrapper.screen_text());
@@ -776,7 +917,10 @@ fn print_capture(
         print!("{}", wrapper.clean_log());
     }
     io::stdout().flush().ok();
-    true
+    CaptureResult {
+        reply_recovered: true,
+        from_result_file: false,
+    }
 }
 
 /// Recovers the fenced reply for `begin`/`end` from the target's own transcript
@@ -868,7 +1012,30 @@ const EX_UNAVAILABLE: u8 = 69;
 /// mid-reply-death reply was still recovered (`reply_recovered`).
 /// `reply_recovered` reflects whether [`print_capture`] actually put a reply on
 /// stdout.
-fn exit_code_for(wrapper: &mut Wrapper, outcome: Outcome, reply_recovered: bool) -> ExitCode {
+///
+/// `from_result_file` arms the exit-0-on-hit override (#79): when the reply came
+/// from the authoritative `--result-file` channel it reached the caller, so the
+/// run SUCCEEDED even if the completion path never fired — `TimedOut` /
+/// `HardTimeout` / `TargetExitedEarly` all map to `0`. Scoped strictly to the
+/// file-hit path: every non-file outcome keeps its existing exit code.
+fn exit_code_for(
+    wrapper: &mut Wrapper,
+    outcome: Outcome,
+    reply_recovered: bool,
+    from_result_file: bool,
+) -> ExitCode {
+    // The answer is already on stdout via the result file — honour it over the
+    // fragile completion path (a no-sentinel timeout AFTER the model replied is
+    // the exact failure this mode exists to fix). Only these three otherwise
+    // non-zero outcomes are overridden; `Idle`/`Completed` already map correctly.
+    if from_result_file
+        && matches!(
+            outcome,
+            Outcome::TimedOut | Outcome::HardTimeout | Outcome::TargetExitedEarly
+        )
+    {
+        return ExitCode::SUCCESS;
+    }
     match outcome {
         Outcome::TimedOut => ExitCode::from(124),
         // The absolute wall-clock cap fired: a retryable transient, distinct from
@@ -1094,7 +1261,7 @@ mod tests {
 
     #[test]
     fn wrap_command_appends_markers() {
-        let w = wrap_command("hello", "B_BEGIN", "B_END");
+        let w = wrap_command("hello", "B_BEGIN", "B_END", None);
         assert!(w.starts_with("hello"));
         assert!(w.contains("B_BEGIN"));
         assert!(w.contains("B_END"));
@@ -1105,9 +1272,69 @@ mod tests {
         // No embedded newline: a newline-submitting TUI (codex) must receive the
         // command and the wrap instruction as ONE submission, else it never sees
         // the instruction and emits no fence (#40).
-        let w = wrap_command("do a thing", "B_BEGIN", "B_END");
+        let w = wrap_command("do a thing", "B_BEGIN", "B_END", None);
         assert!(!w.contains('\n'), "wrap_command must be single-line: {w:?}");
         assert!(w.contains("IMPORTANT"));
+    }
+
+    #[test]
+    fn wrap_command_appends_the_result_file_directive_once() {
+        // With a result-file path the wrap gains exactly one file-writing clause
+        // naming the path; without one the wrap is unchanged. The clause stays on
+        // the SAME single line (the codex newline-submit constraint).
+        let with = wrap_command("q", "B_BEGIN", "B_END", Some("/run/reply.txt"));
+        assert!(with.contains("B_BEGIN") && with.contains("B_END"));
+        assert!(
+            with.contains("/run/reply.txt"),
+            "path must be named: {with:?}"
+        );
+        assert_eq!(
+            with.matches("file-writing tool").count(),
+            1,
+            "the directive must appear exactly once: {with:?}"
+        );
+        assert!(
+            !with.contains('\n'),
+            "the result-file wrap must stay single-line: {with:?}"
+        );
+        let without = wrap_command("q", "B_BEGIN", "B_END", None);
+        assert!(
+            !without.contains("file-writing tool"),
+            "no directive without --result-file: {without:?}"
+        );
+    }
+
+    #[test]
+    fn result_file_flag_sets_the_path_and_requires_extract() {
+        // The flag records the path only alongside --extract (the directive rides
+        // the sentinel wrap); without --extract it is a usage error.
+        let m = parse_from(vec![
+            "--extract".into(),
+            "--result-file".into(),
+            "/run/reply.txt".into(),
+            "--cmd".into(),
+            "hi".into(),
+            "--".into(),
+            "claude".into(),
+        ])
+        .expect("parse");
+        match m {
+            Mode::Run(a) => assert_eq!(a.result_file.as_deref(), Some("/run/reply.txt")),
+            _ => panic!("expected Mode::Run"),
+        }
+        let err = parse_from(vec![
+            "--result-file".into(),
+            "/run/reply.txt".into(),
+            "--cmd".into(),
+            "hi".into(),
+            "--".into(),
+            "claude".into(),
+        ])
+        .expect_err("expected a usage error without --extract");
+        assert!(
+            err.contains("--result-file requires --extract"),
+            "got: {err}"
+        );
     }
 
     #[test]

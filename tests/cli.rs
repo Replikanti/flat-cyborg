@@ -453,3 +453,248 @@ fn no_grace_diagnostic_when_the_target_exits() {
         "the grace diagnostic must not fire on a target that exited: {stderr:?}"
     );
 }
+
+/// A unique temp path for a result-file test, cleaned up before use so a stale
+/// file from an earlier run cannot be mistaken for this run's reply.
+fn result_file_path(tag: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("fcb-result-{}-{}.txt", std::process::id(), tag));
+    std::fs::remove_file(&p).ok();
+    p
+}
+
+#[test]
+fn result_file_is_preferred_over_the_screen() {
+    // The target writes one reply to the --result-file path and prints a
+    // DIFFERENT sentinel-fenced reply on screen. flat-cyborg must print the FILE
+    // contents (file > screen) and exit 0. The banner makes the target render
+    // early so the pre-typing readiness wait passes and the command is typed.
+    let path = result_file_path("preferred");
+    let script = format!(
+        "printf 'BANNER\\n'; read l; b=; e=; for w in $l; do \
+         case $w in FCB_*_BEGIN) b=$w ;; FCB_*_END) e=$w ;; esac; done; \
+         printf 'FILE_REPLY\\n' > '{}'; \
+         printf '%s\\nSCREEN_REPLY\\n%s\\n' \"$b\" \"$e\"",
+        path.display()
+    );
+    let out = Command::new(bin())
+        .args([
+            "--extract",
+            "--no-jitter",
+            "--idle-ms",
+            "300",
+            "--timeout-ms",
+            "10000",
+            "--result-file",
+            &path.to_string_lossy(),
+            "--cmd",
+            "hi",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run with --result-file");
+    std::fs::remove_file(&path).ok();
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "FILE_REPLY",
+        "the file reply must win over the screen: {stdout:?}"
+    );
+}
+
+#[test]
+fn result_file_empty_falls_back_byte_identically_with_a_diagnostic() {
+    // --result-file set but never written by the target: flat-cyborg must emit
+    // ONE loud stderr diagnostic naming the no-op AND fall through to the screen
+    // extraction, byte-identical to the same run without --result-file.
+    let path = result_file_path("empty"); // deliberately never created
+    let script = "printf 'BANNER\\n'; read l; b=; e=; for w in $l; do \
+         case $w in FCB_*_BEGIN) b=$w ;; FCB_*_END) e=$w ;; esac; done; \
+         printf '%s\\nSCREEN_REPLY\\n%s\\n' \"$b\" \"$e\"";
+    let base_args = [
+        "--extract",
+        "--no-jitter",
+        "--idle-ms",
+        "300",
+        "--timeout-ms",
+        "10000",
+        "--cmd",
+        "hi",
+        "--",
+        "sh",
+        "-c",
+        script,
+    ];
+    // Without --result-file: the reference output.
+    let plain = Command::new(bin())
+        .args(base_args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run without --result-file");
+    // With --result-file pointing at an unwritten path.
+    let armed = Command::new(bin())
+        .args(["--result-file", &path.to_string_lossy()])
+        .args(base_args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run with an unwritten --result-file");
+    std::fs::remove_file(&path).ok();
+    assert!(plain.status.success() && armed.status.success());
+    assert_eq!(
+        armed.stdout, plain.stdout,
+        "the fallback must be byte-identical to a run without --result-file"
+    );
+    let stderr = String::from_utf8_lossy(&armed.stderr);
+    assert!(
+        stderr.contains("empty or unwritten"),
+        "expected the result-file no-op diagnostic, stderr: {stderr:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&armed.stdout).trim(),
+        "SCREEN_REPLY",
+        "the screen reply must still be recovered on fallback"
+    );
+}
+
+#[test]
+fn result_file_hit_exits_0_even_on_a_watchdog_timeout() {
+    // The exit-0-on-file-hit override: the target writes the reply to the file
+    // then sleeps without ever fencing it, so strict --extract never completes
+    // and the graceful watchdog fires (a 124 without --result-file). Because the
+    // answer already reached the caller via the file, the run must exit 0 and
+    // print the file contents. The hard cap is raised above --timeout-ms so the
+    // graceful watchdog (not the hard cap) is the outcome being overridden.
+    let path = result_file_path("override");
+    let script = format!(
+        "printf 'BANNER\\n'; read l; printf 'FILE_ONLY_REPLY\\n' > '{}'; sleep 30",
+        path.display()
+    );
+    let out = Command::new(bin())
+        .args([
+            "--extract",
+            "--no-jitter",
+            "--idle-ms",
+            "300",
+            "--timeout-ms",
+            "800",
+            "--hard-timeout-ms",
+            "30000",
+            "--result-file",
+            &path.to_string_lossy(),
+            "--cmd",
+            "hi",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run with a timing-out --result-file target");
+    std::fs::remove_file(&path).ok();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a non-empty result file must override the timeout exit code; stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "FILE_ONLY_REPLY",
+        "the file reply must be printed even after the timeout"
+    );
+}
+
+#[test]
+fn result_file_without_extract_is_a_usage_error() {
+    // The directive rides the --extract sentinel wrap, so --result-file without
+    // --extract is a usage error (exit 2), naming the requirement.
+    let out = Command::new(bin())
+        .args([
+            "--result-file",
+            "/tmp/x",
+            "--cmd",
+            "hi",
+            "--",
+            "sh",
+            "-c",
+            "true",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run --result-file without --extract");
+    assert_eq!(out.status.code(), Some(2), "expected usage exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--result-file requires --extract"),
+        "stderr: {stderr:?}"
+    );
+}
+
+#[test]
+fn result_file_stale_content_on_a_reused_path_is_not_read_as_the_new_reply() {
+    // Regression (PR #84 review): a driver reuses ONE fixed --result-file path
+    // across turns (what $FLAT_CYBORG_RESULT_FILE_PATH invites). Turn 1 writes a
+    // reply and fences it (completes, exit 0, file now holds ANSWER_ONE). Turn 2
+    // asks a different question, writes NOTHING, and hangs → a real timeout. The
+    // arm-time truncation must clear the stale ANSWER_ONE before turn 2, so
+    // flat-cyborg must NOT print turn 1's content and must NOT exit 0: the read
+    // falls through to the screen (no fence there) and the watchdog timeout (124)
+    // surfaces. Without the guard this printed ANSWER_ONE and exited 0.
+    let path = result_file_path("stale-reuse");
+    let script = format!(
+        "n=1; printf 'BANNER\\n'; while read l; do \
+         b=; e=; for w in $l; do \
+         case $w in FCB_*_BEGIN) b=$w ;; FCB_*_END) e=$w ;; esac; done; \
+         if [ \"$n\" = 1 ]; then printf 'ANSWER_ONE\\n' > '{}'; \
+         printf '%s\\nDONE_ONE\\n%s\\n' \"$b\" \"$e\"; \
+         else sleep 30; fi; n=$((n+1)); done",
+        path.display()
+    );
+    let out = Command::new(bin())
+        .args([
+            "--extract",
+            "--no-jitter",
+            "--idle-ms",
+            "300",
+            "--timeout-ms",
+            "800",
+            "--hard-timeout-ms",
+            "30000",
+            "--result-file",
+            &path.to_string_lossy(),
+            "--cmd",
+            "q1",
+            "--cmd",
+            "q2",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run two turns on one reused --result-file path");
+    std::fs::remove_file(&path).ok();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("ANSWER_ONE"),
+        "turn 1's stale reply must not be read as turn 2's answer: {stdout:?}"
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a stale file must not arm the exit-0 override on a genuine timeout; \
+         stdout: {stdout:?}, stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "the real watchdog timeout must surface once the stale file is cleared"
+    );
+}
