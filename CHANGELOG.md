@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **An invisible code point in a `--cmd` prompt no longer leaves the prompt
+  unsent.** claude's editor strips invisible characters from submitted input
+  (zero-width space/joiners, bidi controls, BOM, soft hyphen, variation
+  selectors, tags, C1 controls, U+2028/2029, ...) and then swallows the submit
+  Enter with "Removed 1 invisible character · review and press Enter to send".
+  The prompt sat in the input box until the run idled out, with no reply and no
+  transcript — deterministically, on every retry, for any prompt that carried
+  one such character (e.g. a stray U+200B in pasted brief text). flat-cyborg
+  now removes those code points before typing/pasting any command; the target
+  would drop them anyway, so what it receives is unchanged. Tab/LF/CR and
+  visible characters (including U+00A0) are untouched.
+
 ## [0.17.0] - 2026-09-13
 
 ### Added

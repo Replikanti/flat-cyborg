@@ -469,6 +469,20 @@ impl Wrapper {
     /// # Errors
     /// Returns an error if writing to the master fails.
     pub fn send(&mut self, command: &str) -> Result<()> {
+        // An invisible code point in the prompt makes claude's editor strip it
+        // and swallow the submit Enter ("Removed 1 invisible character · review
+        // and press Enter to send"), so the prompt is never sent and the run
+        // idles out with no reply. Strip them up front: the target would drop
+        // them anyway, so what it receives is unchanged.
+        let cleaned = strip_invisible(command);
+        if cleaned.len() != command.len() {
+            crate::diag!(
+                "input.strip_invisible",
+                "removed_bytes={}",
+                command.len() - cleaned.len()
+            );
+        }
+        let command: &str = &cleaned;
         if self.config.paste_input {
             return self.send_paste(command);
         }
@@ -923,6 +937,56 @@ fn fold_line(line: &str, width: usize, out: &mut Vec<String>) {
         start = cut;
     }
     out.push(chars[start..].iter().collect());
+}
+
+/// Whether `c` is an invisible code point that an interactive LLM editor
+/// (claude) silently removes from submitted input: Unicode format characters
+/// (general category `Cf`: zero-width space/joiners, bidi controls, BOM, word
+/// joiner, interlinear annotation, tags), the remaining default-ignorable code
+/// points (soft hyphen, combining grapheme joiner, Hangul fillers, variation
+/// selectors, Mongolian free variation selectors), the C1 controls (incl. NEL)
+/// and the Unicode line/paragraph separators. Tab, LF and CR are plain C0 and
+/// stay untouched; so does a visible no-break space.
+pub(crate) fn is_invisible(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0080..=0x009F
+            | 0x00AD
+            | 0x034F
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x115F..=0x1160
+            | 0x17B4..=0x17B5
+            | 0x180B..=0x180F
+            | 0x200B..=0x200F
+            | 0x2028..=0x202E
+            | 0x2060..=0x206F
+            | 0x3164
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+            | 0xFFA0
+            | 0xFFF0..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0000..=0xE0FFF
+    )
+}
+
+/// Returns `text` with every [`is_invisible`] code point removed, borrowing
+/// when there is nothing to strip (the common case costs no allocation).
+pub(crate) fn strip_invisible(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().any(is_invisible) {
+        std::borrow::Cow::Owned(text.chars().filter(|&c| !is_invisible(c)).collect())
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
 }
 
 /// Wraps `body` in the bracketed-paste markers (`ESC[200~` … `ESC[201~`) that an
@@ -1866,6 +1930,38 @@ mod tests {
         // The bullet-prefixed BEGIN line is not a standalone marker, and the gate
         // does not require it to be.
         assert_eq!(transcript_line_hits(transcript, "FCB_X_BEGIN"), 0);
+    }
+
+    #[test]
+    fn strip_invisible_removes_editor_dropped_code_points() {
+        // Every code point here was observed (claude 2.1.281, bracketed paste)
+        // to trigger "Removed 1 invisible character · review and press Enter
+        // to send", which swallows the submit and leaves the prompt unsent.
+        for cp in [
+            0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x2060, 0xFEFF, 0x202E, 0x2066, 0x00AD,
+            0xE0041, 0x180E, 0x034F, 0x2028, 0x2029, 0xFE0F, 0x3164, 0x061C, 0x1D173, 0xFFF9,
+            0x0085,
+        ] {
+            let c = char::from_u32(cp).unwrap();
+            let input = format!("shipped/{c}documented");
+            assert_eq!(
+                strip_invisible(&input),
+                "shipped/documented",
+                "U+{cp:04X} must be stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_invisible_keeps_visible_text_and_borrows() {
+        let text =
+            "tab\there\nline \u{00A0}nbsp \u{2014} arrows \u{2192} emoji \u{1F600} caf\u{00E9}";
+        let out = strip_invisible(text);
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "no-op must not allocate"
+        );
+        assert_eq!(out, text);
     }
 
     #[test]
